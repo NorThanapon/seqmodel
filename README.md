@@ -31,7 +31,6 @@ language modeling, definition modeling, and common encoder-decoder stuffs.
 
 ## Usage
 
-
 ### Preprocessing data
 
 By default, this code needs a vocabulary file(s), and text data split into 3 files:

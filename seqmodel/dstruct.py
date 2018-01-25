@@ -37,6 +37,34 @@ OutputStateTuple = collections.namedtuple('OutputStateTuple', ('output', 'state'
 IndexScoreTuple = collections.namedtuple('IndexScoreTuple', ('index', 'score'))
 
 
+class Pair(collections.Sequence):
+    def __init__(self, a, b=None):
+        if b is None:
+            self._pair = tuple(a)
+        else:
+            self._pair = (a, b)
+
+    def __iter__(self):
+        self._i = 0
+        return self
+
+    def __next__(self):
+        self._i += 1
+        if self._i >= 3:
+            raise StopIteration
+        else:
+            return self._pair[self._i - 1]
+
+    def __len__(self):
+        return 2
+
+    def __getitem__(self, key):
+        return self._pair[key]
+
+    def __repr__(self):
+        return self._pair.__repr__()
+
+
 class Vocabulary(object):
 
     special_symbols = {

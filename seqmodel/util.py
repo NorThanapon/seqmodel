@@ -20,7 +20,7 @@ __all__ = ['dict_with_key_startswith', 'dict_with_key_endswith', 'get_with_dot_k
            'hstack_list', 'masked_full_like', 'get_logger', 'get_common_argparser',
            'parse_set_args', 'add_arg_group_defaults', 'ensure_dir', 'time_span_str',
            'init_exp_opts', 'save_exp', 'load_exp', 'hstack_with_padding', 'chunks',
-           'vstack_with_padding', 'group_data', 'find_first_min_zero',
+           'vstack_with_padding', 'group_data', 'find_first_min_zero', 'nested_map',
            'get_recursive_dict', 'filter_tfvars_in_checkpoint', 'get_model_class']
 
 
@@ -50,6 +50,20 @@ def ensure_dir(directory, delete=False):
             i += 1
         os.rename(directory, current)
         os.makedirs(directory)
+
+
+def nested_map(fn, maybe_structure, *args):
+    if isinstance(maybe_structure, (list, tuple)):
+        structure = maybe_structure
+        output = []
+        for maybe_structure in zip(structure, *args):
+            output.append(nested_map(fn, *maybe_structure))
+        try:
+            return type(structure)(output)
+        except TypeError:
+            return type(structure)(*output)
+    else:
+        return fn(maybe_structure, *args)
 
 
 _log_level = {None: py_logging.NOTSET, 'debug': py_logging.DEBUG,

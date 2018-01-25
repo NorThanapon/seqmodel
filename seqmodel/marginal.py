@@ -9,17 +9,19 @@ import numpy as np
 import tensorflow as tf
 
 from seqmodel import util
+from seqmodel import dstruct
 from seqmodel import graph as tfg
 from seqmodel import cells as tfcell
 from seqmodel import model as _sqm
 
 
 __all__ = [
-    'AESeqModel', 'GaussianSeqModel', 'VAESeqModel',
-    'UnigramSeqModel', 'UnigramSeqModelH']
+    'AESeqModel', 'GaussianSeqModel', 'VariationalSeqModel',
+    'UnigramSeqModel', 'UnigramSeqModelH', 'VAESeqModel']
 
 NONE = tf.no_op()
 tfdense = tf.layers.dense
+_nax_ = tf.newaxis
 
 
 def sample_normal(mu, scale):
@@ -37,11 +39,22 @@ def log_sum_exp(x, axis=-1, keep_dims=False):
         return tf.squeeze(out, [axis])
 
 
+# def kl_normal(mu0, scale0, mu1, scale1):
+#     v0 = (scale0 ** 2) + 1e-6
+#     v1 = (scale1 ** 2) + 1e-6
+#     l2 = (mu1 - mu0) ** 2
+#     return 0.5 * ((v0 + l2) / v1 + tf.log(v1) - tf.log(v0) - 1)
+
 def kl_normal(mu0, scale0, mu1, scale1):
-    v0 = (scale0 ** 2) + 1e-6
-    v1 = (scale1 ** 2) + 1e-6
-    l2 = (mu1 - mu0) ** 2
-    return 0.5 * ((v0 + l2) / v1 + tf.log(v1) - tf.log(v0) - 1)
+    # from tensorflow repo
+    one = tf.constant(1, dtype=tf.float32)
+    two = tf.constant(2, dtype=tf.float32)
+    half = tf.constant(0.5, dtype=tf.float32)
+    s_a_squared = tf.square(scale0)
+    s_b_squared = tf.square(scale1)
+    ratio = s_a_squared / s_b_squared
+    return (tf.square(mu0 - mu1) / (two * s_b_squared) +  # larger as v1 goes down
+            half * (ratio - one - tf.log(ratio)))  # minimize ratio, maximize log ratio?
 
 
 def kl_mvn_diag(mu0, diag_scale0, mu1, diag_scale1):
@@ -258,121 +271,6 @@ def IAF_graph(T, out_dim, inputs, activation=tf.nn.tanh, scope=None):
     return z, log_pdf
 
 
-class UnigramSeqModel(_sqm.SeqModel):
-
-    def _build_rnn(
-            self, opt, lookup, seq_len, initial_state, batch_size, reuse_scope, reuse,
-            nodes):
-        cell_opt = util.dict_with_key_startswith(opt, 'cell:')
-        batch_size = self._get_batch_size(lookup)
-        input_dim = lookup.shape[-1]
-        if opt['out:eval_first_token']:
-            lookup = tf.concat((tf.zeros((1, batch_size, input_dim)), lookup), axis=0)
-            seq_len += 1
-        max_num_tokens = tf.shape(lookup)[0]
-        with tfg.maybe_scope(reuse_scope[self._RSK_RNN_], reuse=True) as scope:
-            _reuse = reuse or scope is not None
-            cell_ = tfg.create_cells(input_size=opt['emb:dim'], **cell_opt)
-            cell_output_, initial_state_, final_state_ = tfg.create_rnn(
-                cell_, lookup, seq_len, initial_state, rnn_fn=opt['rnn:fn'],
-                batch_size=batch_size)
-
-            wildcard_lookup = tf.zeros((1, input_dim))
-            wildcard_states = tfcell.nested_map(
-                lambda state: tf.zeros((1, state.shape[-1])), initial_state_)
-            x = wildcard_lookup
-            for i, (cell, z) in enumerate(zip(cell_._cells, wildcard_states)):
-                with tf.variable_scope(f'rnn/multi_rnn_cell/cell_{i}', reuse=True):
-                    x, __ = cell(x, z)
-            x = tf.tile(x[tf.newaxis, :, :], [max_num_tokens, batch_size, 1])
-            extra_nodes = {'unigram_features': x}
-        return cell_, cell_output_, initial_state_, final_state_, extra_nodes
-
-    def _build_logit(
-            self, opt, reuse_scope, collect_kwargs, emb_vars, cell_output,
-            nodes=None, **kwargs):
-        unigram_features = nodes['unigram_features']
-        # logit
-        logit_w_ = emb_vars if opt['share:input_emb_logit'] else None
-        logit_opt = util.dict_with_key_startswith(opt, 'logit:')
-        with tfg.maybe_scope(
-                reuse_scope[self._RSK_LOGIT_], name='logit') as scope:
-            logit_, temperature_, logit_w_, logit_b_ = tfg.get_logit_layer(
-                cell_output, logit_w=logit_w_, **logit_opt, **collect_kwargs)
-            scope.reuse_variables()
-            unigram_logit_, temperature_, logit_w_, logit_b_ = tfg.get_logit_layer(
-                unigram_features, logit_w=logit_w_, logit_b=logit_b_,
-                temperature=temperature_, **logit_opt, **collect_kwargs)
-        # generation
-        dist_, dec_max_, dec_sample_ = tfg.select_from_logit(logit_)
-        # formating output
-        predict_fetch = {
-            'logit': logit_, 'dist': dist_, 'dec_max': dec_max_,
-            'dec_max_id': dec_max_.index, 'dec_sample': dec_sample_,
-            'dec_sample_id': dec_sample_.index}
-        nodes = util.dict_with_key_endswith(locals(), '_')
-        return logit_, predict_fetch, nodes
-
-    def _build_loss(
-            self, opt, logit, label, weight, seq_weight, nodes, collect_key,
-            add_to_collection, inputs=None, **kwargs):
-        weight = tf.multiply(weight, seq_weight)
-        if opt['out:eval_first_token']:
-            label = nodes['full_seq']
-            init_w_shape = (1, self._get_batch_size(weight))
-            weight = tf.concat([tf.ones(init_w_shape, dtype=tf.float32), weight], 0)
-        num_sequences = tf.reduce_sum(seq_weight)
-        num_tokens = tf.reduce_sum(weight)
-
-        # likelihood
-        c_token_nll = tf.nn.sparse_softmax_cross_entropy_with_logits(
-            logits=logit, labels=label) * weight
-        u_token_nll = tf.nn.sparse_softmax_cross_entropy_with_logits(
-            logits=nodes['unigram_logit'], labels=label) * weight
-
-        # combine everything
-        loss = c_token_nll + u_token_nll
-        loss = tf.reduce_sum(loss) / num_sequences
-
-        # Format output info
-        debug_info = {
-            'avg.tokens::c_ppl|exp': tf.reduce_sum(c_token_nll) / num_tokens,
-            'num.tokens::c_ppl|exp': num_tokens,
-            'avg.tokens::u_ppl|exp': tf.reduce_sum(u_token_nll) / num_tokens,
-            'num.tokens::u_ppl|exp': num_tokens}
-        train_fetch = {'train_loss': loss, 'debug_info': debug_info}
-        eval_fetch = {'eval_loss': loss, 'debug_info': debug_info}
-        if opt['out:token_nll']:
-            eval_fetch['token_nll'] = c_token_nll
-        return train_fetch, eval_fetch, {}
-
-
-class UnigramSeqModelH(UnigramSeqModel):
-    def _build_rnn(
-            self, opt, lookup, seq_len, initial_state, batch_size, reuse_scope, reuse,
-            nodes):
-        cell_opt = util.dict_with_key_startswith(opt, 'cell:')
-        batch_size = self._get_batch_size(lookup)
-        input_dim = lookup.shape[-1]
-        max_num_tokens = tf.shape(lookup)[0]
-        if opt['out:eval_first_token']:
-            max_num_tokens += 1
-        with tfg.maybe_scope(reuse_scope[self._RSK_RNN_], reuse=True) as scope:
-            _reuse = reuse or scope is not None
-            cell_ = tfg.create_cells(input_size=opt['emb:dim'], **cell_opt)
-            cell_output_, initial_state_, final_state_ = tfg.create_rnn(
-                cell_, lookup, seq_len, initial_state, rnn_fn=opt['rnn:fn'],
-                batch_size=batch_size)
-
-            h0_states = cell_._init_vars[-1]
-            x = h0_states[tf.newaxis, tf.newaxis, :]
-            u_out = tf.tile(x, [max_num_tokens, batch_size, 1])
-            extra_nodes = {'unigram_features': u_out}
-            if opt['out:eval_first_token']:
-                cell_output_ = tf.concat([x, cell_output_], axis=0)
-        return cell_, cell_output_, initial_state_, final_state_, extra_nodes
-
-
 class GaussianSeqModel(_sqm.SeqModel):
 
     def _build_rnn(
@@ -384,7 +282,7 @@ class GaussianSeqModel(_sqm.SeqModel):
             gauss_wrapper = partial(
                 tfcell.GaussianCellWrapper,
                 num_hidden_layers=1, hidden_actvn=tf.nn.elu,
-                mean_actvn=None, scale_actvn=tf.nn.softplus)
+                mean_actvn=None, scale_actvn=tf.nn.softplus, sample_actvn=tf.nn.tanh)
             cell_ = tfg.create_cells(
                 input_size=opt['emb:dim'], cell_wrapper=gauss_wrapper, **cell_opt)
             cell_ = tfcell.StateOutputCellWrapper(cell_)
@@ -415,7 +313,7 @@ class GaussianSeqModel(_sqm.SeqModel):
         return train_fetch, eval_fetch, loss_nodes
 
 
-class VAESeqModel(_sqm.SeqModel):
+class VariationalSeqModel(_sqm.SeqModel):
 
     _FULL_SEQ_ = True
 
@@ -426,7 +324,8 @@ class VAESeqModel(_sqm.SeqModel):
             num_hidden_layers=0,
             hidden_actvn=tf.nn.relu,
             scale_actvn=tf.nn.softplus,
-            mean_actvn=None)
+            mean_actvn=None,
+            sample_actvn=tf.nn.tanh)
         cell = tfg.create_cells(
             input_size=opt['emb:dim'], cell_wrapper=gauss_wrapper, **cell_opt)
         if get_states:
@@ -436,15 +335,11 @@ class VAESeqModel(_sqm.SeqModel):
     def _build_rnn(
             self, opt, lookup, seq_len, initial_state, batch_size,
             reuse_scope, reuse, nodes):
-        # TODO: added variable for null word_0 and null state (z_0) to predict
-        #       unigram distributions (every token)
         concat0 = partial(tf.concat, axis=0)
         new0axis = partial(tf.expand_dims, axis=0)
         unroll_rnn = partial(tfg.create_rnn, rnn_fn=opt['rnn:fn'], batch_size=batch_size)
         rnn_nodes = {}
         full_seq_lookup = nodes.get('full_lookup', lookup)
-        # if initial_state is None:
-        #     initial_state = tuple((None, None))
         # Inference Network
         with tf.variable_scope('inference') as scope:
             q_cell = self._create_cell(opt, get_states=True)
@@ -474,8 +369,6 @@ class VAESeqModel(_sqm.SeqModel):
         rnn_nodes.update(util.dict_with_key_endswith(locals(), '_'))
         initial_state = q_init_h
         final_state = q_final_h
-        # initial_state = tuple((q_init_h, g_init_h))
-        # final_state = tuple((q_final_h, g_final_h))
         return q_cell, q_out_, initial_state, final_state, rnn_nodes
 
     def _build_logit(
@@ -527,21 +420,19 @@ class VAESeqModel(_sqm.SeqModel):
         for i, (g_h, q_h) in enumerate(zip(g_states, q_states)):
             g_token_norm += tf.reduce_sum(tf.square(g_h.mean)/2, axis=-1) * weight
             q_token_norm += tf.reduce_sum(tf.square(q_h.mean)/2, axis=-1) * weight
-            # gq_token_div += tf.reduce_sum(
-            #     tf.square(g_h.mean - q_h.mean)/2, axis=-1) * weight
-            gprior_token_div += kl_mvn_diag(
-                g_h.mean, g_h.scale,
-                tf.stop_gradient(g_h.mean),
-                tf.stop_gradient(tf.maximum(g_h.scale, 1 / 200))) * weight
+            gprior_token_div += kl_mvn_diag(g_h.mean, g_h.scale, 0.0, 0.5) * weight
             gq_token_div += kl_mvn_diag(
                 q_h.mean, q_h.scale,
-                tf.stop_gradient(g_h.mean), tf.stop_gradient(g_h.scale)) * weight
+                g_h.mean, g_h.scale) * weight
+            # gq_token_div += kl_mvn_diag(
+            #     q_h.mean, q_h.scale,
+            #     tf.stop_gradient(g_h.mean), tf.stop_gradient(g_h.scale)) * weight
 
         # combine everything
         norm_regularizers = g_token_norm + q_token_norm
-        loss = g_token_nll + gprior_token_div
+        loss = g_token_nll + (1/200) * gprior_token_div
         loss += q_token_nll + gq_token_div
-        loss += (1/200) * norm_regularizers
+        # loss += (1/200) * norm_regularizers
         loss = tf.reduce_sum(loss) / num_sequences
         # loss = tf.Print(
         #     loss,
@@ -555,6 +446,8 @@ class VAESeqModel(_sqm.SeqModel):
             'avg.tokens::g_ppl|exp': tf.reduce_sum(g_token_nll) / num_tokens,
             'num.tokens::g_ppl|exp': num_tokens,
             'avg.tokens::q_ppl|exp': tf.reduce_sum(q_token_nll) / num_tokens,
+            'num.tokens::q_ppl|exp': num_tokens,
+            'avg.tokens::kl_qg|exp': tf.reduce_sum(gq_token_div) / num_tokens,
             'num.tokens::q_ppl|exp': num_tokens}
         train_fetch = {'train_loss': loss, 'debug_info': debug_info}
         eval_fetch = {'eval_loss': loss, 'debug_info': debug_info}
@@ -841,3 +734,310 @@ class AESeqModel(_sqm.SeqModel):
         if q_states is not None:
             self._feed_state(feed_dict, self._q_out.state, q_states)
         return feed_dict
+
+
+class UnigramSeqModel(_sqm.SeqModel):
+
+    def _build_rnn(
+            self, opt, lookup, seq_len, initial_state, batch_size, reuse_scope, reuse,
+            nodes):
+        cell_opt = util.dict_with_key_startswith(opt, 'cell:')
+        batch_size = self._get_batch_size(lookup)
+        input_dim = lookup.shape[-1]
+        if opt['out:eval_first_token']:
+            lookup = tf.concat((tf.zeros((1, batch_size, input_dim)), lookup), axis=0)
+            seq_len += 1
+        max_num_tokens = tf.shape(lookup)[0]
+        with tfg.maybe_scope(reuse_scope[self._RSK_RNN_], reuse=True) as scope:
+            _reuse = reuse or scope is not None
+            cell_ = tfg.create_cells(input_size=opt['emb:dim'], **cell_opt)
+            cell_output_, initial_state_, final_state_ = tfg.create_rnn(
+                cell_, lookup, seq_len, initial_state, rnn_fn=opt['rnn:fn'],
+                batch_size=batch_size)
+
+            wildcard_lookup = tf.zeros((1, input_dim))
+            wildcard_states = tfcell.nested_map(
+                lambda state: tf.zeros((1, state.shape[-1])), initial_state_)
+            x = wildcard_lookup
+            for i, (cell, z) in enumerate(zip(cell_._cells, wildcard_states)):
+                with tf.variable_scope(f'rnn/multi_rnn_cell/cell_{i}', reuse=True):
+                    x, __ = cell(x, z)
+            x = tf.tile(x[tf.newaxis, :, :], [max_num_tokens, batch_size, 1])
+            extra_nodes = {'unigram_features': x}
+        return cell_, cell_output_, initial_state_, final_state_, extra_nodes
+
+    def _build_logit(
+            self, opt, reuse_scope, collect_kwargs, emb_vars, cell_output,
+            nodes=None, **kwargs):
+        unigram_features = nodes['unigram_features']
+        # logit
+        logit_w_ = emb_vars if opt['share:input_emb_logit'] else None
+        logit_opt = util.dict_with_key_startswith(opt, 'logit:')
+        with tfg.maybe_scope(
+                reuse_scope[self._RSK_LOGIT_], name='logit') as scope:
+            logit_, temperature_, logit_w_, logit_b_ = tfg.get_logit_layer(
+                cell_output, logit_w=logit_w_, **logit_opt, **collect_kwargs)
+            scope.reuse_variables()
+            unigram_logit_, temperature_, logit_w_, logit_b_ = tfg.get_logit_layer(
+                unigram_features, logit_w=logit_w_, logit_b=logit_b_,
+                temperature=temperature_, **logit_opt, **collect_kwargs)
+        # generation
+        dist_, dec_max_, dec_sample_ = tfg.select_from_logit(logit_)
+        # formating output
+        predict_fetch = {
+            'logit': logit_, 'dist': dist_, 'dec_max': dec_max_,
+            'dec_max_id': dec_max_.index, 'dec_sample': dec_sample_,
+            'dec_sample_id': dec_sample_.index}
+        nodes = util.dict_with_key_endswith(locals(), '_')
+        return logit_, predict_fetch, nodes
+
+    def _build_loss(
+            self, opt, logit, label, weight, seq_weight, nodes, collect_key,
+            add_to_collection, inputs=None, **kwargs):
+        weight = tf.multiply(weight, seq_weight)
+        if opt['out:eval_first_token']:
+            label = nodes['full_seq']
+            init_w_shape = (1, self._get_batch_size(weight))
+            weight = tf.concat([tf.ones(init_w_shape, dtype=tf.float32), weight], 0)
+        num_sequences = tf.reduce_sum(seq_weight)
+        num_tokens = tf.reduce_sum(weight)
+
+        # likelihood
+        c_token_nll = tf.nn.sparse_softmax_cross_entropy_with_logits(
+            logits=logit, labels=label) * weight
+        u_token_nll = tf.nn.sparse_softmax_cross_entropy_with_logits(
+            logits=nodes['unigram_logit'], labels=label) * weight
+
+        # combine everything
+        loss = c_token_nll + u_token_nll
+        loss = tf.reduce_sum(loss) / num_sequences
+
+        # Format output info
+        debug_info = {
+            'avg.tokens::c_ppl|exp': tf.reduce_sum(c_token_nll) / num_tokens,
+            'num.tokens::c_ppl|exp': num_tokens,
+            'avg.tokens::u_ppl|exp': tf.reduce_sum(u_token_nll) / num_tokens,
+            'num.tokens::u_ppl|exp': num_tokens}
+        train_fetch = {'train_loss': loss, 'debug_info': debug_info}
+        eval_fetch = {'eval_loss': loss, 'debug_info': debug_info}
+        if opt['out:token_nll']:
+            eval_fetch['token_nll'] = c_token_nll
+        return train_fetch, eval_fetch, {}
+
+
+class UnigramSeqModelH(UnigramSeqModel):
+    def _build_rnn(
+            self, opt, lookup, seq_len, initial_state, batch_size, reuse_scope, reuse,
+            nodes):
+        cell_opt = util.dict_with_key_startswith(opt, 'cell:')
+        batch_size = self._get_batch_size(lookup)
+        input_dim = lookup.shape[-1]
+        max_num_tokens = tf.shape(lookup)[0]
+        if opt['out:eval_first_token']:
+            max_num_tokens += 1
+        with tfg.maybe_scope(reuse_scope[self._RSK_RNN_], reuse=True) as scope:
+            _reuse = reuse or scope is not None
+            cell_ = tfg.create_cells(input_size=opt['emb:dim'], **cell_opt)
+            cell_output_, initial_state_, final_state_ = tfg.create_rnn(
+                cell_, lookup, seq_len, initial_state, rnn_fn=opt['rnn:fn'],
+                batch_size=batch_size)
+
+            # h0_states = cell_._init_vars[-1]
+            # x = h0_states[tf.newaxis, tf.newaxis, :]
+            # u_out = tf.tile(x, [max_num_tokens, batch_size, 1])
+            # XXX: LSTMCell won't work
+            u_out = cell_.tiled_init_state(batch_size, max_num_tokens)[-1]
+            x = cell_.tiled_init_state(batch_size, 1)[-1]
+            extra_nodes = {'unigram_features': u_out}
+            if opt['out:eval_first_token']:
+                cell_output_ = tf.concat([x, cell_output_], axis=0)
+        return cell_, cell_output_, initial_state_, final_state_, extra_nodes
+
+
+class VAESeqModel(UnigramSeqModel):
+
+    _FULL_SEQ_ = True
+    _IS_DECODING_ = False
+
+    def _normal_cell_state(self, opt, inputs, state_size):
+        self._auto_num = 0
+
+        def tensor2normal(size):
+            h1 = tfdense(
+                inputs, size, activation=tf.nn.elu, name=f'hidden0_{self._auto_num}')
+            h1 = h1 + inputs
+            h2 = tfdense(
+                h1, size, activation=tf.nn.elu, name=f'hidden1_{self._auto_num}')
+            h2 = h2 + h1
+            mean, scale = tf.split(tfdense(
+                h2, size * 2, name=f'normal_{self._auto_num}'), 2, axis=-1)
+            scale = tf.nn.softplus(scale)
+            mean = tf.nn.tanh(mean)
+            self._auto_num += 1
+            return dstruct.Pair(mean, scale)
+
+        return util.nested_map(tensor2normal, state_size)
+
+    def _create_cell(self, opt, remove_init_opt=False, get_states=False):
+        cell_opt = util.dict_with_key_startswith(opt, 'cell:')
+        if remove_init_opt:
+            cell_opt.update(init_state_trainable=False, reset_state_prob=0.0)
+        vae_cell_wrapper = partial(
+            tfcell.NormalInitStateCellWrapper, output_reset=not self._IS_DECODING_,
+            actvn=None)
+        cell = tfg.create_cells(
+            input_size=opt['emb:dim'],
+            init_wrapper_class=vae_cell_wrapper, **cell_opt)
+        if get_states:
+            cell = tfcell.StateOutputCellWrapper(cell)
+        return cell
+
+    def _build_rnn(
+            self, opt, lookup, seq_len, initial_state, batch_size,
+            reuse_scope, reuse, nodes):
+        if batch_size is None:
+            batch_size = self._get_batch_size(lookup)
+        if opt['out:eval_first_token']:
+            # XXX: need to merge
+            return self._build_margina_rnn(
+                opt, lookup, seq_len, initial_state, batch_size,
+                reuse_scope, reuse, nodes)
+
+        max_num_tokens = tf.shape(lookup)[0]
+        unroll_rnn = partial(tfg.create_rnn, rnn_fn=opt['rnn:fn'], batch_size=batch_size)
+        reverse_seq = partial(
+            tf.reverse_sequence, seq_lengths=seq_len, seq_axis=0, batch_axis=1)
+        rnn_nodes = {}
+        full_seq_lookup = nodes['full_lookup']
+        # Inference Network
+        with tf.variable_scope('inference') as q_scope:
+            rev_label_lookup = reverse_seq(full_seq_lookup[1:])
+            q_cell = self._create_cell(opt, remove_init_opt=True)
+            q_out_, __, q_final_h = unroll_rnn(q_cell, rev_label_lookup, seq_len, None)
+            q_out_ = reverse_seq(q_out_)
+        # Generative Network
+        with tf.variable_scope('generative') as g_scope:
+            g_cell_ = self._create_cell(opt)
+            with tf.variable_scope(q_scope):
+                qstates_ = self._normal_cell_state(opt, q_out_, g_cell_.state_size)
+            g_input = lookup
+            if not self._IS_DECODING_:
+                g_input = tfcell.AEStateCellInput(full_seq_lookup[:-1], qstates_)
+            g_out_, g_init_h, g_final_h = unroll_rnn(
+                g_cell_, g_input, seq_len, initial_state)
+            if isinstance(g_out_, tfcell.ResetCellOutput):
+                g_out_, reset = g_out_
+                reset = tf.squeeze(reset, axis=-1)
+            else:
+                reset = tf.zeros((max_num_tokens, batch_size), dtype=tf.float32)
+        rnn_nodes.update(util.dict_with_key_endswith(locals(), '_'))
+        initial_state = g_init_h
+        final_state = g_final_h
+        u_out = g_cell_.tiled_init_state(batch_size, max_num_tokens)[-1]
+        rnn_nodes.update(unigram_features=u_out, reset=reset)
+        return g_cell_, g_out_, initial_state, final_state, rnn_nodes
+
+    def _build_margina_rnn(
+            self, opt, lookup, seq_len, initial_state, batch_size,
+            reuse_scope, reuse, nodes):
+        # TODO: merge this into the _build_rnn
+        unroll_rnn = partial(tfg.create_rnn, rnn_fn=opt['rnn:fn'], batch_size=batch_size)
+        full_seq_lookup = nodes['full_lookup']
+        input_dim = full_seq_lookup.shape[-1]
+        max_num_tokens = tf.shape(full_seq_lookup)[0]
+        reverse_seq = partial(
+            tf.reverse_sequence, seq_lengths=seq_len + 1, seq_axis=0, batch_axis=1)
+        rnn_nodes = {}
+        # Inference Network
+        with tf.variable_scope('inference') as q_scope:
+            rev_label_lookup = reverse_seq(full_seq_lookup)
+            q_cell = self._create_cell(opt, remove_init_opt=True)
+            q_out_, __, __ = unroll_rnn(q_cell, rev_label_lookup, seq_len + 1, None)
+            q_out_ = reverse_seq(q_out_)
+            # q_out_ = tf.Print(
+            #     q_out_, [tf.reduce_mean(q_out_[0]), tf.reduce_mean(q_out_[1])])
+        # Generative Network
+        with tf.variable_scope('generative') as g_scope:
+            g_cell_ = self._create_cell(opt)
+            with tf.variable_scope(q_scope):
+                qstates_ = self._normal_cell_state(opt, q_out_[0], g_cell_.state_size)
+                qsamples_ = util.nested_map(self._sample_normal, qstates_)
+            g_out_, g_init_h, g_final_h = unroll_rnn(
+                g_cell_, full_seq_lookup[:-1], seq_len, qsamples_)
+        rnn_nodes.update(util.dict_with_key_endswith(locals(), '_'))
+        initial_state = g_init_h
+        final_state = g_final_h
+        u_out = g_cell_.tiled_init_state(batch_size, max_num_tokens)[-1]
+        # x = g_cell_.tiled_init_state(batch_size, 1)[-1]
+        rnn_nodes.update(unigram_features=u_out)
+        # XXX: does not work with LSTM
+        g_out_ = tf.concat([tf.expand_dims(qsamples_[-1], axis=0), g_out_], axis=0)
+        return g_cell_, g_out_, initial_state, final_state, rnn_nodes
+
+    def _build_loss(
+            self, opt, logit, label, weight, seq_weight, nodes, collect_key,
+            add_to_collection, inputs=None, **kwargs):
+        weight = tf.multiply(weight, seq_weight)
+        if opt['out:eval_first_token']:
+            label = nodes['full_seq']
+            init_w_shape = (1, self._get_batch_size(weight))
+            weight = tf.concat([tf.ones(init_w_shape, dtype=tf.float32), weight], 0)
+        num_sequences = tf.reduce_sum(seq_weight)
+        num_tokens = tf.reduce_sum(weight)
+
+        # likelihood
+        c_token_nll = tf.nn.sparse_softmax_cross_entropy_with_logits(
+            logits=logit, labels=label) * weight
+        u_token_nll = tf.nn.sparse_softmax_cross_entropy_with_logits(
+            logits=nodes['unigram_logit'], labels=label) * weight
+
+        # kld
+        pstates = nodes['g_cell'].init_state
+        qstates = nodes['qstates']
+        _layer_kld = util.nested_map(self._kld, qstates, pstates)
+        kld = tf.add_n(_layer_kld)
+        if 'reset' in nodes:
+            kld = kld * nodes['reset']
+
+        # kld = tf.Print(kld, [kld])
+        # kld = tf.Print(kld, [tf.reduce_mean(x) for x in _layer_kld])
+        # kld = tf.Print(kld, [tf.reduce_mean(x) for x in qstates[-1]])
+        # combine everything
+        loss = c_token_nll + u_token_nll + 0.1 * kld
+        loss = tf.reduce_sum(loss) / num_sequences
+        # loss = tf.Print(
+        #     loss, [tf.reduce_sum(x) for x in [c_token_nll, u_token_nll, kld]])
+        # Format output info
+        debug_info = {
+            'avg.tokens::c_ppl|exp': tf.reduce_sum(c_token_nll) / num_tokens,
+            'num.tokens::c_ppl|exp': num_tokens,
+            'avg.tokens::u_ppl|exp': tf.reduce_sum(u_token_nll) / num_tokens,
+            'num.tokens::u_ppl|exp': num_tokens}
+        eval_fetch = {'eval_loss': loss, 'debug_info': debug_info}
+        if 'reset' in nodes:
+            total_resets = tf.reduce_sum(nodes['reset'])
+            debug_info = dict(debug_info)
+            debug_info.update({
+                'avg.tokens::kld': tf.reduce_sum(kld) / total_resets,
+                'num.tokens::kld': total_resets})
+        train_fetch = {'train_loss': loss, 'debug_info': debug_info}
+
+        if opt['out:token_nll']:
+            eval_fetch['token_nll'] = c_token_nll
+        return train_fetch, eval_fetch, {}
+
+    def _kld(self, qstate, pstate):
+        qmu, qscale = qstate
+        pmu, pscale = pstate
+        return kl_mvn_diag(
+            qmu, qscale,
+            *(tf.stop_gradient(p[_nax_, _nax_, :]) for p in (pmu, pscale)))
+        # return kl_mvn_diag(
+        #     qmu, qscale,
+        #     *(p[_nax_, _nax_, :] for p in (pmu, pscale)))
+
+    def _sample_normal(self, pair):
+        mean, scale = pair
+        sample = mean + scale * tf.random_normal(tf.shape(mean))
+        # sample = tf.Print(sample, [tf.reduce_mean(mean), tf.shape(mean)])
+        return sample

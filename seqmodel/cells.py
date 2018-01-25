@@ -7,75 +7,184 @@ import numpy as np
 import tensorflow as tf
 
 from seqmodel import graph as tfg
+from seqmodel.util import nested_map
+from seqmodel.dstruct import Pair
 from seqmodel.dstruct import OutputStateTuple
 
 tfdense = tf.layers.dense
 
 
-def nested_map(fn, maybe_structure, *args):
-    if isinstance(maybe_structure, (list, tuple)):
-        structure = maybe_structure
-        output = []
-        for maybe_structure in zip(structure, *args):
-            output.append(nested_map(fn, *maybe_structure))
-        try:
-            return type(structure)(output)
-        except TypeError:
-            return type(structure)(*output)
-    else:
-        return fn(maybe_structure, *args)
+ResetCellOutput = namedtuple('ResetCellOutput', 'output reset')
 
 
 class InitStateCellWrapper(tf.nn.rnn_cell.RNNCell):
     def __init__(
             self, cell, state_reset_prob=0.0, trainable=False,
-            dtype=tf.float32, actvn=None):
+            dtype=tf.float32, actvn=tf.nn.tanh, output_reset=False):
         self._cell = cell
         self._init_vars = self._create_init_vars(trainable, dtype, actvn)
+        self._dtype = dtype
         self._reset_prob = state_reset_prob
+        self._actvn = actvn
+        self._output_reset = output_reset
 
     @property
     def output_size(self):
+        if self._output_reset:
+            return ResetCellOutput(self._cell.output_size, 1)
         return self._cell.output_size
 
     @property
     def state_size(self):
         return self._cell.state_size
 
+    @property
+    def init_state(self):
+        return self._init_vars
+
     def _create_init_vars(self, trainable, dtype, actvn=None):
         self._i = 0
         with tf.variable_scope('init_state'):
             def create_init_var(size):
-                # TODO: create variance and a special function to generate batch of these
                 var = tf.get_variable(
                     f'init_{self._i}', shape=(size, ), dtype=dtype,
                     initializer=tf.zeros_initializer(), trainable=trainable)
-                # var = tf.get_variable(
-                #     f'init_{self._i}', shape=(size, ), dtype=dtype, trainable=trainable)
                 if actvn is not None:
                     var = actvn(var)
                 self._i = self._i + 1
                 return var
             return nested_map(create_init_var, self.state_size)
 
-    def zero_state(self, batch_size, dtype):
-        def batch_tile(var):
-            return tf.tile(var[tf.newaxis, :], (batch_size, 1))
-        return nested_map(batch_tile, self._init_vars)
+    def _get_reset(self, inputs):
+        # TODO: better way to figure out the batch size
+        batch_size = tf.shape(inputs)[0]
+        rand = tf.random_uniform((batch_size, ))
+        r = tf.cast(tf.less(rand, self._reset_prob), tf.float32)
+        r = r[:, tf.newaxis]
+        return r, batch_size
+
+    def _get_zero_reset(self, inputs):
+        batch_size = tf.shape(inputs)[0]
+        return tf.zeros((batch_size, 1), dtype=tf.float32)
 
     def __call__(self, inputs, state, scope=None):
+        r = None
         if self._reset_prob > 0.0:
-            # TODO: inputs can be nested too!
-            batch_size = tf.shape(inputs)[0]
-            rand = tf.random_uniform((batch_size, ))
-            z = tf.cast(tf.less(rand, self._reset_prob), tf.float32)
-            z = z[:, tf.newaxis]
+            r, batch_size = self._get_reset(inputs)
+            state = self.select_state(state, r, batch_size)
+        cell_output, new_state = self._cell(inputs, state)
+        if self._output_reset:
+            if self._reset_prob <= 0.0:
+                r = self._get_zero_reset(inputs)
+            return ResetCellOutput(cell_output, r), new_state
+        else:
+            return cell_output, new_state
 
-            def gate_cur_state(cur_state, init_var):
-                return z * (init_var[tf.newaxis, :] - cur_state) + cur_state
+    def select_state(self, state, r, batch_size):
+        def _select(cur_state, init_var):
+            return r * (init_var[tf.newaxis, :] - cur_state) + cur_state
+        return nested_map(_select, state, self._init_vars)
 
-            state = nested_map(gate_cur_state, state, self._init_vars)
-        return self._cell(inputs, state)
+    def tiled_init_state(self, batch_size, seq_len=None):
+        def _tile(var):
+            if seq_len is not None:
+                return tf.tile(var[tf.newaxis, tf.newaxis, :], (seq_len, batch_size, 1))
+            return tf.tile(var[tf.newaxis, :], (batch_size, 1))
+        return nested_map(_tile, self._init_vars)
+
+    def zero_state(self, batch_size, dtype):
+        assert dtype == self._dtype, \
+            'dtype must be the same as dtype during the cell construction'
+        return self.tiled_init_state(batch_size)
+
+
+AEStateCellInput = namedtuple('AEStateCellInput', 'inputs qstate')
+
+
+class NormalInitStateCellWrapper(InitStateCellWrapper):
+
+    _SCALE_INIT_ = 0.5  # softplus(0.5) = 0.974, closed enough to 1.0
+
+    def __init__(
+            self, cell, state_reset_prob=0.0, trainable=False,
+            dtype=tf.float32, actvn=None, output_reset=False,
+            mean_actvn=tf.nn.tanh, scale_actvn=tf.nn.softplus):
+        self._mean_actvn = mean_actvn
+        self._scale_actvn = scale_actvn
+        super().__init__(cell, state_reset_prob, trainable, dtype, actvn, output_reset)
+
+    def __call__(self, inputs, state, scope=None):
+        if isinstance(inputs, AEStateCellInput):
+            inputs, q_state = inputs
+        else:
+            q_state = None
+        if self._reset_prob > 0.0:
+            r, batch_size = self._get_reset(inputs)
+            state = self.select_state(
+                state, r, batch_size, injected_states=q_state)
+        cell_output, new_state = self._cell(inputs, state)
+        if self._output_reset:
+            if self._reset_prob <= 0.0:
+                r = self._get_zero_reset(inputs)
+            return ResetCellOutput(cell_output, r), new_state
+        else:
+            return cell_output, new_state
+
+    def _create_init_vars(self, trainable, dtype, actvn=None):
+        self._i = 0
+        with tf.variable_scope('init_state'):
+            def create_init_var(size):
+                # mean = tf.get_variable(
+                #     f'init_mean_{self._i}', shape=(size, ), dtype=dtype,
+                #     initializer=tf.zeros_initializer(), trainable=trainable)
+                mean = self._mean_actvn(tf.get_variable(
+                    f'init_mean_{self._i}', shape=(size, ), dtype=dtype,
+                    initializer=tf.zeros_initializer(), trainable=trainable))
+
+                scale = self._scale_actvn(tf.get_variable(
+                    f'init_scale_{self._i}', shape=(size, ), dtype=dtype,
+                    initializer=tf.constant_initializer(value=self._SCALE_INIT_),
+                    trainable=trainable))
+                self._i = self._i + 1
+                return Pair(mean, scale)
+            return nested_map(create_init_var, self.state_size)
+
+    def tiled_init_state(self, batch_size, seq_len=None):
+        def _tile(var):
+            mean, scale = var
+            if seq_len is not None:
+                mean = tf.tile(mean[tf.newaxis, tf.newaxis, :], (seq_len, batch_size, 1))
+                scale = scale[tf.newaxis, tf.newaxis, :]
+            else:
+                mean = tf.tile(mean[tf.newaxis, :], (batch_size, 1))
+                scale = scale[tf.newaxis, :]
+            sample = mean + scale * tf.random_normal(tf.shape(mean))
+            if self._actvn is not None:
+                sample = self._actvn(sample)
+            return sample
+        return nested_map(_tile, self._init_vars)
+
+    def select_state(self, state, r, batch_size, injected_states=None):
+        need_tile = injected_states is None
+
+        def _select(cur_state, var):
+            mean, scale = var
+            if need_tile:
+                mean = tf.tile(mean[tf.newaxis, :], (batch_size, 1))
+                scale = scale[tf.newaxis, :]
+            init_state = mean + scale * tf.random_normal(tf.shape(mean))
+            if self._actvn is not None:
+                init_state = self._actvn(init_state)
+            return r * (init_state - cur_state) + cur_state
+
+        if injected_states is None:
+            injected_states = self._init_vars
+        return nested_map(_select, state, injected_states)
+
+    def zero_state(self, batch_size, dtype):
+        assert dtype == self._dtype, \
+            'dtype must be the same as dtype during the cell construction'
+        return self.tiled_init_state(batch_size)
 
 
 class StateOutputCellWrapper(tf.nn.rnn_cell.RNNCell):
@@ -141,7 +250,7 @@ class GaussianCellWrapper(tf.nn.rnn_cell.RNNCell):
 
     def __init__(
             self, cell, num_hidden_layers=1, hidden_actvn=tf.nn.elu,
-            mean_actvn=None, scale_actvn=tf.nn.softplus, use_mean=False):
+            mean_actvn=None, scale_actvn=tf.nn.softplus, sample_actvn=None):
         self._cell = cell
         self._num_layers = num_hidden_layers
         self._hactvn = hidden_actvn
@@ -153,7 +262,9 @@ class GaussianCellWrapper(tf.nn.rnn_cell.RNNCell):
         self._sactvn = scale_actvn
         if isinstance(self._sactvn, six.string_types):
             self._sactvn = locate(self._sactvn)
-        self._use_mean = use_mean
+        self._zactvn = sample_actvn
+        if isinstance(self._zactvn, six.string_types):
+            self._zactvn = locate(self._zactvn)
 
     @property
     def output_size(self):
@@ -177,8 +288,7 @@ class GaussianCellWrapper(tf.nn.rnn_cell.RNNCell):
                 h = tfdense(
                     gauss_input, gauss_input.shape[-1], activation=self._hactvn,
                     name=f'hidden_{i}')
-                h = tf.nn.dropout(h, 0.75)
-                gauss_input += h
+                gauss_input + h
             mean, scale = tf.split(
                 tfdense(gauss_input, gauss_input.shape[-1] * 2, name='gauss'), 2, axis=-1)
             if self._sactvn is not None:
@@ -187,11 +297,9 @@ class GaussianCellWrapper(tf.nn.rnn_cell.RNNCell):
                 mean = self._mactvn(mean)
             max_scale = tf.constant(gauss_input.shape[-1].value, dtype=tf.float32)
             scale = tf.minimum(max_scale, scale)
-            # scale = tf.Print(scale, [tf.reduce_mean(mean), tf.reduce_mean(scale)])
             noise = scale * tf.random_normal(tf.shape(mean))
-            if self._use_mean:
-                print('MEAN')
-                noise = noise * 0.0
             new_state = mean + noise
-            new_output = tf.nn.dropout(mean, 0.75) + noise
+            if self._zactvn is not None:
+                new_state = self._zactvn(new_state)
+            new_output = new_state
             return new_output, GaussianState(mean, scale, new_state)

@@ -195,6 +195,7 @@ def create_cells(
         in_keep_prob=1.0, out_keep_prob=1.0, state_keep_prob=1.0, variational=False,
         input_size=None, dropout_last_output=True, cell_wrapper=None,
         init_state_trainable=False, reset_state_prob=0.0,
+        init_wrapper_class=custom_cells.InitStateCellWrapper,
         final_cell_wrapper=None, **cell_kwargs):
     """return an RNN cell with optionally DropoutWrapper and MultiRNNCell."""
     cells = []
@@ -220,8 +221,8 @@ def create_cells(
     # else:
     final_cell = tf.nn.rnn_cell.MultiRNNCell(cells)
     if init_state_trainable or reset_state_prob > 0.0:
-        final_cell = custom_cells.InitStateCellWrapper(
-            final_cell, actvn=tf.nn.tanh,
+        final_cell = init_wrapper_class(
+            final_cell,
             trainable=init_state_trainable,
             state_reset_prob=reset_state_prob)
     if final_cell_wrapper is not None:
@@ -1061,7 +1062,7 @@ def create_train_op(
     """return train operation graph"""
     if isinstance(optim_class, six.string_types):
         optim_class = locate(optim_class)
-    optim = optim_class(learning_rate=learning_rate, **optim_kwarg)
+    optim = optim_class(learning_rate=learning_rate, beta1=0.0, **optim_kwarg)
     # var_list = tf.trainable_variables()
     var_list = []
     for v in tf.trainable_variables():

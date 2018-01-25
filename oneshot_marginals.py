@@ -19,11 +19,12 @@ data_dir = 'data/ptb/'
 # count_file = 'curexp/ptb-v/sample.5.count'
 # trace_nll_file = 'curexp/ptb-v/sample_nll.txt'
 # model_dir = 'curexp/ptb-v'
-m = 'h_star-reset-10'
+m = 'qh_normal-reset-10-unigram'
 sample_file = f'curexp/ptb-{m}/sample.txt'
 eval_file = f'curexp/ptb-{m}/sample.count-filter-text'
 count_file = f'curexp/ptb-{m}/sample.5.count'
 model_dir = f'curexp/ptb-{m}'
+# model_dir = 'tmp2'
 total_tokens = 0
 with open(sample_file) as lines:
     for line in lines:
