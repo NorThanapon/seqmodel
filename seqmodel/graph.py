@@ -194,7 +194,7 @@ def create_cells(
         num_units, num_layers, cell_class=tf.nn.rnn_cell.BasicLSTMCell,
         in_keep_prob=1.0, out_keep_prob=1.0, state_keep_prob=1.0, variational=False,
         input_size=None, dropout_last_output=True, cell_wrapper=None,
-        init_state_trainable=False, reset_state_prob=0.0,
+        init_state_trainable=False, reset_state_prob=0.0, wrap_state=False,
         init_wrapper_class=custom_cells.InitStateCellWrapper,
         final_cell_wrapper=None, **cell_kwargs):
     """return an RNN cell with optionally DropoutWrapper and MultiRNNCell."""
@@ -220,7 +220,7 @@ def create_cells(
     #     final_cell = cells[0]
     # else:
     final_cell = tf.nn.rnn_cell.MultiRNNCell(cells)
-    if init_state_trainable or reset_state_prob > 0.0:
+    if init_state_trainable or reset_state_prob > 0.0 or wrap_state:
         final_cell = init_wrapper_class(
             final_cell,
             trainable=init_state_trainable,
@@ -840,7 +840,7 @@ def get_logit_layer(
             #     f'{prefix}bias', [output_size], dtype=tf.float32, trainable=trainable,
             #     initializer=tf.zeros_initializer())
             logit_b = tf.get_variable(
-                f'logit_b', [output_size], dtype=tf.float32, trainable=trainable,
+                f'{prefix}bias', [output_size], dtype=tf.float32, trainable=trainable,
                 initializer=tf.zeros_initializer())
         logit = logit + logit_b
     if temperature is None:
@@ -1062,7 +1062,9 @@ def create_train_op(
     """return train operation graph"""
     if isinstance(optim_class, six.string_types):
         optim_class = locate(optim_class)
-    optim = optim_class(learning_rate=learning_rate, beta1=0.0, **optim_kwarg)
+    if optim_class == tf.train.AdamOptimizer:
+        optim_kwarg['beta1'] = 0.0
+    optim = optim_class(learning_rate=learning_rate, **optim_kwarg)
     # var_list = tf.trainable_variables()
     var_list = []
     for v in tf.trainable_variables():

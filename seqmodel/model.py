@@ -302,6 +302,7 @@ class SeqModel(Model):
         # collect nodes
         nodes = util.dict_with_key_endswith(locals(), '_')
         nodes.update(ex_nodes)
+        nodes['batch_size'] = batch_size
         predict_fetch = {'cell_output': cell_output_}
         graph_args = {
             'feature_feed': dstruct.SeqFeatureTuple(input_, seq_len_),
@@ -338,6 +339,7 @@ class SeqModel(Model):
             self, opt, lookup, seq_len, initial_state, batch_size, reuse_scope, reuse,
             nodes):
         cell_opt = util.dict_with_key_startswith(opt, 'cell:')
+        rnn_nodes = {}
         with tfg.maybe_scope(reuse_scope[self._RSK_RNN_], reuse=True) as scope:
             _reuse = reuse or scope is not None
             cell_ = tfg.create_cells(input_size=opt['emb:dim'], **cell_opt)
@@ -345,26 +347,35 @@ class SeqModel(Model):
             cell_output_, initial_state_, final_state_ = tfg.create_rnn(
                 cell_, lookup, seq_len, initial_state, rnn_fn=opt['rnn:fn'],
                 batch_size=batch_size)
+
+            first_output = initial_state_[-1]
+            if isinstance(first_output, tf.nn.rnn_cell.LSTMStateTuple):
+                first_output = first_output.h
             if opt['out:eval_first_token']:
-                first_output = initial_state_[-1]
-                if isinstance(first_output, tf.nn.rnn_cell.LSTMStateTuple):
-                    first_output = first_output.h
                 cell_output_ = tf.concat(
                     (tf.expand_dims(first_output, 0), cell_output_), 0)
-        return cell_, cell_output_, initial_state_, final_state_, {}
+            rnn_nodes.update(unigram_features=first_output)
+        return cell_, cell_output_, initial_state_, final_state_, rnn_nodes
 
     def _build_logit(
-            self, opt, reuse_scope, collect_kwargs, emb_vars, cell_output, **kwargs):
+            self, opt, reuse_scope, collect_kwargs, emb_vars, cell_output, nodes=None,
+            **kwargs):
         # logit
         logit_w_ = emb_vars if opt['share:input_emb_logit'] else None
         logit_opt = util.dict_with_key_startswith(opt, 'logit:')
-        with tfg.maybe_scope(reuse_scope[self._RSK_LOGIT_]) as scope:
+        with tfg.maybe_scope(reuse_scope[self._RSK_LOGIT_], name='logit') as scope:
             logit_, temperature_, logit_w_, logit_b_ = tfg.get_logit_layer(
                 cell_output, logit_w=logit_w_, **logit_opt, **collect_kwargs)
+            scope.reuse_variables()
+            unigram_logit_, temperature_, logit_w_, logit_b_ = tfg.get_logit_layer(
+                nodes['unigram_features'], logit_w=logit_w_, logit_b=logit_b_,
+                temperature=temperature_, **logit_opt, **collect_kwargs)
         # format
         dist_, dec_max_, dec_sample_ = tfg.select_from_logit(logit_)
+        log_dist_ = tf.nn.log_softmax(logit_)
+        log_u_dist_ = tf.nn.log_softmax(unigram_logit_)
         predict_fetch = {
-            'logit': logit_, 'dist': dist_, 'dec_max': dec_max_,
+            'logit': logit_, 'dist': dist_, 'log_dist': log_dist_, 'dec_max': dec_max_,
             'dec_max_id': dec_max_.index, 'dec_sample': dec_sample_,
             'dec_sample_id': dec_sample_.index}
         nodes = util.dict_with_key_endswith(locals(), '_')
@@ -447,6 +458,7 @@ class SeqModel(Model):
             batch_size = self._batch_size
         else:
             batch_size = tf.shape(inputs)[1]
+            self._batch_size = batch_size
         return batch_size
 
     def _get_fetch(self, mode, extra_fetch=None, fetch_state=False, **kwargs):

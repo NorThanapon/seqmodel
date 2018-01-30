@@ -293,7 +293,7 @@ def read_word2def_data(
         if dec_ == ['']:
             dec_ = []
         dec_ = out_vocab.w2i([sod_sym] + dec_ + [eod_sym])
-        word_ = enc_[0]
+        word_ = enc_[0]  # assume the first word is the word being defined
         char_ = char_vocab.w2i(tokens2chars(part[0]))
         freq[word_] += 1
         enc_data.append(enc_)

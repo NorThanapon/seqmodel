@@ -750,7 +750,8 @@ class UnigramSeqModel(_sqm.SeqModel):
         max_num_tokens = tf.shape(lookup)[0]
         with tfg.maybe_scope(reuse_scope[self._RSK_RNN_], reuse=True) as scope:
             _reuse = reuse or scope is not None
-            cell_ = tfg.create_cells(input_size=opt['emb:dim'], **cell_opt)
+            cell_ = tfg.create_cells(
+                input_size=opt['emb:dim'], wrap_state=True, **cell_opt)
             cell_output_, initial_state_, final_state_ = tfg.create_rnn(
                 cell_, lookup, seq_len, initial_state, rnn_fn=opt['rnn:fn'],
                 batch_size=batch_size)
@@ -765,31 +766,6 @@ class UnigramSeqModel(_sqm.SeqModel):
             x = tf.tile(x[tf.newaxis, :, :], [max_num_tokens, batch_size, 1])
             extra_nodes = {'unigram_features': x}
         return cell_, cell_output_, initial_state_, final_state_, extra_nodes
-
-    def _build_logit(
-            self, opt, reuse_scope, collect_kwargs, emb_vars, cell_output,
-            nodes=None, **kwargs):
-        unigram_features = nodes['unigram_features']
-        # logit
-        logit_w_ = emb_vars if opt['share:input_emb_logit'] else None
-        logit_opt = util.dict_with_key_startswith(opt, 'logit:')
-        with tfg.maybe_scope(
-                reuse_scope[self._RSK_LOGIT_], name='logit') as scope:
-            logit_, temperature_, logit_w_, logit_b_ = tfg.get_logit_layer(
-                cell_output, logit_w=logit_w_, **logit_opt, **collect_kwargs)
-            scope.reuse_variables()
-            unigram_logit_, temperature_, logit_w_, logit_b_ = tfg.get_logit_layer(
-                unigram_features, logit_w=logit_w_, logit_b=logit_b_,
-                temperature=temperature_, **logit_opt, **collect_kwargs)
-        # generation
-        dist_, dec_max_, dec_sample_ = tfg.select_from_logit(logit_)
-        # formating output
-        predict_fetch = {
-            'logit': logit_, 'dist': dist_, 'dec_max': dec_max_,
-            'dec_max_id': dec_max_.index, 'dec_sample': dec_sample_,
-            'dec_sample_id': dec_sample_.index}
-        nodes = util.dict_with_key_endswith(locals(), '_')
-        return logit_, predict_fetch, nodes
 
     def _build_loss(
             self, opt, logit, label, weight, seq_weight, nodes, collect_key,
@@ -837,7 +813,8 @@ class UnigramSeqModelH(UnigramSeqModel):
             max_num_tokens += 1
         with tfg.maybe_scope(reuse_scope[self._RSK_RNN_], reuse=True) as scope:
             _reuse = reuse or scope is not None
-            cell_ = tfg.create_cells(input_size=opt['emb:dim'], **cell_opt)
+            cell_ = tfg.create_cells(
+                input_size=opt['emb:dim'], wrap_state=True, **cell_opt)
             cell_output_, initial_state_, final_state_ = tfg.create_rnn(
                 cell_, lookup, seq_len, initial_state, rnn_fn=opt['rnn:fn'],
                 batch_size=batch_size)
@@ -848,7 +825,7 @@ class UnigramSeqModelH(UnigramSeqModel):
             # XXX: LSTMCell won't work
             u_out = cell_.tiled_init_state(batch_size, max_num_tokens)[-1]
             x = cell_.tiled_init_state(batch_size, 1)[-1]
-            extra_nodes = {'unigram_features': u_out}
+            extra_nodes = {'unigram_features': u_out, 'max_num_tokens': max_num_tokens}
             if opt['out:eval_first_token']:
                 cell_output_ = tf.concat([x, cell_output_], axis=0)
         return cell_, cell_output_, initial_state_, final_state_, extra_nodes
@@ -1003,8 +980,12 @@ class VAESeqModel(UnigramSeqModel):
         # kld = tf.Print(kld, [tf.reduce_mean(x) for x in _layer_kld])
         # kld = tf.Print(kld, [tf.reduce_mean(x) for x in qstates[-1]])
         # combine everything
-        loss = c_token_nll + u_token_nll + 0.1 * kld
-        loss = tf.reduce_sum(loss) / num_sequences
+        _c = tf.get_variable(
+            'kld_weight', dtype=tf.float32, initializer=0.1, trainable=False)
+        update_c = tf.assign(_c, tf.minimum(_c * 1.0004, 1.0))
+        with tf.control_dependencies([update_c]):
+            loss = c_token_nll + u_token_nll + _c * kld
+            loss = tf.reduce_sum(loss) / num_sequences
         # loss = tf.Print(
         #     loss, [tf.reduce_sum(x) for x in [c_token_nll, u_token_nll, kld]])
         # Format output info

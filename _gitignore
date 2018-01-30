@@ -1,0 +1,15 @@
+.ipynb_checkpoints/
+*.pyc
+__pycache__
+.remote-sync.json
+/data/
+/script/data/_cached
+/script/bin/experiment
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+*.code-workspace
+*.ini
+.vscode
+*_steve.*
+*_thor.*

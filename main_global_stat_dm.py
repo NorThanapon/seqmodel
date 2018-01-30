@@ -65,8 +65,8 @@ def decode(opt, gns_opt, vocabs, model, sess, data, state,
     dec_tokens = 0
     model.set_default_feed('temperature', temperature, set_all=True)
     with open(opath, 'w') as dofp, open(opath + '.words', 'w') as wofp:
-        for batch, samples in sq.decode_epoch(sess, model, batch_iter, greedy=False,
-                                              num_samples=1):
+        for batch, samples in sq.decode_epoch(
+                sess, model, batch_iter, greedy=False, num_samples=1):
             words = vocabs[0].i2w(batch.features.words)
             for b_samples in samples:
                 b_seq_len = sq.find_first_min_zero(b_samples)

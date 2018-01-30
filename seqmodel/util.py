@@ -16,12 +16,14 @@ from nltk.translate import bleu_score
 from seqmodel import dstruct as ds
 
 
-__all__ = ['dict_with_key_startswith', 'dict_with_key_endswith', 'get_with_dot_key',
-           'hstack_list', 'masked_full_like', 'get_logger', 'get_common_argparser',
-           'parse_set_args', 'add_arg_group_defaults', 'ensure_dir', 'time_span_str',
-           'init_exp_opts', 'save_exp', 'load_exp', 'hstack_with_padding', 'chunks',
-           'vstack_with_padding', 'group_data', 'find_first_min_zero', 'nested_map',
-           'get_recursive_dict', 'filter_tfvars_in_checkpoint', 'get_model_class']
+__all__ = [
+    'dict_with_key_startswith', 'dict_with_key_endswith', 'get_with_dot_key',
+    'hstack_list', 'masked_full_like', 'get_logger', 'get_common_argparser',
+    'parse_set_args', 'add_arg_group_defaults', 'ensure_dir', 'time_span_str',
+    'init_exp_opts', 'save_exp', 'load_exp', 'hstack_with_padding', 'chunks',
+    'vstack_with_padding', 'group_data', 'find_first_min_zero', 'nested_map',
+    'get_recursive_dict', 'filter_tfvars_in_checkpoint', 'get_model_class',
+    'log_linear', 'log_normal', 'log_softmax', 'softmax', 'log_sumexp']
 
 
 def chunks(alist, num_chunks):
@@ -249,6 +251,38 @@ def find_first_min_zero(arr):
 #         mask = (num_non_padding - 1)[:, None] < np.arange(np_data.shape[0])
 #         arr[mask.T] = 0
 #     return arr, total_non_pad
+
+
+def log_linear(x, mu):
+    dot_product = np.sum(x * mu, axis=-1)
+    return dot_product
+
+
+def log_normal(x, mu, var=1.0):
+    k = -0.5 * (np.log(2 * np.pi) + np.log(var) + np.square(x - mu) / var)
+    return np.sum(k, axis=-1)
+
+
+def softmax(logit, axis=-1):
+    max_logit = np.max(logit, axis=axis, keepdims=True)
+    exp_logit = np.exp(logit - max_logit)
+    return exp_logit / exp_logit.sum(axis=axis, keepdims=True)
+
+
+def log_softmax(logit, axis=-1):
+    max_logit = np.max(logit, axis=axis, keepdims=True)
+    exp_logit = np.exp(logit - max_logit)
+    return logit - log_sumexp(logit, axis=axis, keepdims=True)
+
+
+def log_sumexp(logit, axis=-1, keepdims=False):
+    max_logit = np.max(logit, axis=axis, keepdims=True)
+    exp_logit = np.exp(logit - max_logit)
+    logsumexp = max_logit + np.log(exp_logit.sum(axis=axis, keepdims=True))
+    if not keepdims:
+        logsumexp = np.squeeze(logsumexp, axis=axis)
+    return logsumexp
+
 
 ######################################################################
 #    ##     ## ######## ######## ########  ####  ######   ######     #
