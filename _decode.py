@@ -40,9 +40,9 @@ def decode_lm(opt, model_class, model_opt, data_fn, logger, decode_opt, seed):
             return
 
         logger.info('Decoding...')
-        for output, vocabs in sq.uncond_lm_decode(
+        for output, state, vocabs in sq.uncond_lm_decode(
                 sess, model, seed, greedy=decode_opt['decode:greedy'], vocabs=vocabs):
-            yield output, vocabs
+            yield output, state, vocabs
         # for output, vocabs in sq.cached_uncond_lm_decode(
         #         sess, model, seed, greedy=decode_opt['decode:greedy'], vocabs=vocabs):
         #     yield output, vocabs

@@ -819,12 +819,11 @@ class UnigramSeqModelH(UnigramSeqModel):
                 cell_, lookup, seq_len, initial_state, rnn_fn=opt['rnn:fn'],
                 batch_size=batch_size)
 
-            # h0_states = cell_._init_vars[-1]
-            # x = h0_states[tf.newaxis, tf.newaxis, :]
-            # u_out = tf.tile(x, [max_num_tokens, batch_size, 1])
-            # XXX: LSTMCell won't work
             u_out = cell_.tiled_init_state(batch_size, max_num_tokens)[-1]
             x = cell_.tiled_init_state(batch_size, 1)[-1]
+            if isinstance(u_out, tf.nn.rnn_cell.LSTMStateTuple):
+                u_out = u_out.h
+                x = x.h
             extra_nodes = {'unigram_features': u_out, 'max_num_tokens': max_num_tokens}
             if opt['out:eval_first_token']:
                 cell_output_ = tf.concat([x, cell_output_], axis=0)
@@ -911,6 +910,8 @@ class VAESeqModel(UnigramSeqModel):
         initial_state = g_init_h
         final_state = g_final_h
         u_out = g_cell_.tiled_init_state(batch_size, max_num_tokens)[-1]
+        if isinstance(u_out, tf.nn.rnn_cell.LSTMStateTuple):
+            u_out = u_out.h
         rnn_nodes.update(unigram_features=u_out, reset=reset)
         return g_cell_, g_out_, initial_state, final_state, rnn_nodes
 
@@ -945,6 +946,8 @@ class VAESeqModel(UnigramSeqModel):
         initial_state = g_init_h
         final_state = g_final_h
         u_out = g_cell_.tiled_init_state(batch_size, max_num_tokens)[-1]
+        if isinstance(u_out, tf.nn.rnn_cell.LSTMStateTuple):
+            u_out = u_out.h
         # x = g_cell_.tiled_init_state(batch_size, 1)[-1]
         rnn_nodes.update(unigram_features=u_out)
         # XXX: does not work with LSTM

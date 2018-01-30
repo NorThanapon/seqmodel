@@ -23,7 +23,7 @@ __all__ = [
     'init_exp_opts', 'save_exp', 'load_exp', 'hstack_with_padding', 'chunks',
     'vstack_with_padding', 'group_data', 'find_first_min_zero', 'nested_map',
     'get_recursive_dict', 'filter_tfvars_in_checkpoint', 'get_model_class',
-    'log_linear', 'log_normal', 'log_softmax', 'softmax', 'log_sumexp']
+    'log_linear', 'log_normal', 'log_softmax', 'softmax', 'log_sumexp', 'flatten']
 
 
 def chunks(alist, num_chunks):
@@ -66,6 +66,17 @@ def nested_map(fn, maybe_structure, *args):
             return type(structure)(*output)
     else:
         return fn(maybe_structure, *args)
+
+
+def flatten(maybe_structure):
+    _collect = []
+    if isinstance(maybe_structure, (list, tuple)):
+        structure = maybe_structure
+        for maybe_structure in structure:
+            _collect.extend(flatten(maybe_structure))
+    else:
+        _collect.append(maybe_structure)
+    return _collect
 
 
 _log_level = {None: py_logging.NOTSET, 'debug': py_logging.DEBUG,

@@ -212,6 +212,7 @@ def decode_epoch(sess, model, batch_iter, greedy=False, num_samples=1):
 
 
 def uncond_lm_decode(sess, model, feature_seed, greedy=False, vocabs=None):
+    """generate one word at a time"""
     state = None
     feature = feature_seed
     dec_mode = 'dec_max_id' if greedy else 'dec_sample_id'
@@ -222,7 +223,7 @@ def uncond_lm_decode(sess, model, feature_seed, greedy=False, vocabs=None):
         # print(output.shape)
         feature = feature._replace(inputs=output[[-1], :])
         feature.seq_len[:] = 1
-        yield output, vocabs
+        yield output, state, vocabs
 
 
 def cached_uncond_lm_decode(sess, model, feature_seed, greedy=False, vocabs=None):

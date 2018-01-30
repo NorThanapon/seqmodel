@@ -89,13 +89,15 @@ if __name__ == '__main__':
         if opt['char_data']:
             max_tokens = 4000000
         with sq.open_files(tmp_paths, mode='w') as ofps:
+            trace_states = []
             seed_in = np.array([[0] * _b], dtype=np.int32)
             seed_len = np.array([1] * _b, dtype=np.int32)
             features = sq.SeqFeatureTuple(seed_in, seed_len)
             n_tokens = 0
-            for b_sample, vocabs in decode_lm(
-                    opt, MODEL_CLASS, model_opt, data_fn,
-                    logger, decode_opt, features):
+            for b_sample, s_sample, vocabs in decode_lm(
+                    opt, MODEL_CLASS, model_opt, data_fn, logger, decode_opt, features):
+                flat_states = np.concatenate(sq.flatten(s_sample), -1)
+                trace_states.append(flat_states)
                 for i in range(_b):
                     word = vocabs[-1].i2w(b_sample[0, i])
                     if word == '</s>':
@@ -113,6 +115,10 @@ if __name__ == '__main__':
                         ofp.write('\n')
         for fpath in tmp_paths:
             os.remove(fpath)
+        all_states = np.stack(trace_states, axis=1)
+        # all_states = np.reshape(all_states, [-1, all_states.shape[-1]])
+        np.save(f'{opath}-trace', all_states)
+
     else:
         eval_run_fn = None
         if (opt['trace_nll_filename'] is not None and
