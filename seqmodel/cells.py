@@ -53,7 +53,29 @@ class InitStateCellWrapper(tf.nn.rnn_cell.RNNCell):
                     var = actvn(var)
                 self._i = self._i + 1
                 return var
+            if (isinstance(self.state_size[0], tf.nn.rnn_cell.LSTMStateTuple) and
+               trainable):
+                return self._create_lstm_init_vars(trainable, dtype)
             return nested_map(create_init_var, self.state_size)
+
+    def _create_lstm_init_vars(self, trainable, dtype):
+        num_layers = len(self.state_size)
+        states = []
+        for i in range(num_layers):
+            state_size = self.state_size[i]
+            assert isinstance(state_size, tf.nn.rnn_cell.LSTMStateTuple), \
+                '`state_size` is not LSTMStateTuple'
+            c = tf.get_variable(
+                f'init_{i}_c', shape=(state_size.c, ), dtype=dtype,
+                trainable=trainable)
+            h = tf.get_variable(
+                f'init_{i}_h', shape=(state_size.c, ), dtype=dtype,
+                trainable=trainable)
+            c = tf.clip_by_value(c, -1.0, 1.0)
+            h = tf.tanh(h)
+            # h = tf.Print(h, [tf.reduce_mean(h)])
+            states.append(tf.nn.rnn_cell.LSTMStateTuple(c, h))
+        return tuple(states)
 
     def _get_reset(self, inputs):
         # TODO: better way to figure out the batch size

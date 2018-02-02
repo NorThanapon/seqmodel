@@ -25,7 +25,7 @@ def _parse_args():
     parser.add_argument('--num_threads', type=int, default=8, help='')
     parser.add_argument('--batch_size', type=int, default=64, help='')
     parser.add_argument('--vocab_path', type=str, default='data/ptb/vocab.txt', help='')
-    parser.add_argument('--method', type=str, default='default_init', help='')
+    parser.add_argument('--method', type=str, default='init', help='')
     args = parser.parse_args()
     return args
 
@@ -89,7 +89,7 @@ def _load_model(args, vocab):
     filter_var_map = sq.filter_tfvars_in_checkpoint(
         tf.global_variables(), exp_path('checkpoint/best'))
     # saver = tf.train.Saver(filter_var_map)
-    saver = tf.train.Saver()
+    saver = tf.train.Saver(tf.trainable_variables())
     saver.restore(sess, exp_path('checkpoint/best'))
     return model, nodes, sess
 
@@ -108,7 +108,7 @@ def compute_count_ll(eval_ngrams, ngram_counts, total_tokens):
 
 def compute_unigram_ll(sess, nodes, method):
     unigram_nlls = []
-    if method == 'default_init':
+    if method == 'init':
         feed_dict = {nodes['temperature']: 1.0, nodes['batch_size']: 1}
         if 'max_num_tokens' in nodes:
             feed_dict[nodes['max_num_tokens']] = 1
@@ -127,7 +127,7 @@ def compute_ll(eval_fn, batch, method):
     max_steps = batch.features.inputs.shape[0] + 1
     batch_size = batch.features.inputs.shape[-1]
     token_nlls = []
-    if method == 'default_init':
+    if method == 'init':
         result, __ = eval_fn(inputs, labels)
         token_nlls.append(result['token_nll'])
     nll_count = len(token_nlls)
@@ -157,7 +157,7 @@ method = args.method
 print('Loading data...')
 vocab, eval_ngrams, batches = _load_data(args)
 print('Computing marginals...')
-if method == 'ngram-count':
+if method == 'count':
     ngram_counts, total_tokens = _load_count_file(args)
     eval_lls = compute_count_ll(eval_ngrams, ngram_counts, total_tokens)
 else:

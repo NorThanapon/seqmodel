@@ -65,13 +65,12 @@ errors = target_lls - model_lls
 eval_data = np.stack([eval_ngram_counts, eval_ngram_lens, errors], axis=-1)
 
 print('by-lengths')
-_eval_data = eval_data[eval_data[:, 0] > 1]
 for n in range(1, 6):
-    n_eval_data = _eval_data[_eval_data[:, 1] == n]
+    n_eval_data = eval_data[eval_data[:, 1] == n]
     report_error(n_eval_data)
 
 print('by-counts')
-ticks = [0, 2, 5, 10, 50, 100, 500, 2500, 5000, float('inf')]
+ticks = [2, 5, 10, 50, 100, 500, 2500, 5000, float('inf')]
 for i in range(len(ticks) - 1):
     min_count, max_count = ticks[i], ticks[i+1]
     tick_eval_data = eval_data[np.where(

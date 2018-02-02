@@ -143,13 +143,16 @@ if __name__ == '__main__':
                                   collect_fn=collect_fn)
 
         if opt['trace_state_filename'] is not None:
+            assert opt['seq_len'] == 1, '`seq_len` must be 1.'
             states = []
+            # XXX we don't need to predict likelihood.
 
             def collect_fn(batch, collect):
                 state = collect[0]
-                state = np.concatenate(state, -1) * np.expand_dims(collect[1], -1)
+                flat_states = np.concatenate(
+                    sq.flatten(state), -1) * collect[1][:, np.newaxis]
                 # state = np.reshape(state, (-1, state.shape[-1]))
-                states.append(state)
+                states.append(flat_states)
 
             eval_run_fn = partial(
                 sq.run_collecting_epoch,
@@ -163,6 +166,6 @@ if __name__ == '__main__':
         if opt['trace_state_filename'] is not None:
             np.save(
                 os.path.join(opt['exp_dir'], opt['trace_state_filename']),
-                np.stack(states, 0))
+                np.stack(states, 1))
 
     logger.info(f'Total time: {sq.time_span_str(time.time() - start_time)}')

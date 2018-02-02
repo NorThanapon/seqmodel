@@ -202,7 +202,10 @@ def create_cells(
     for layer in range(num_layers):
         if isinstance(cell_class, six.string_types):
             cell_class = locate(cell_class)
-        cell = cell_class(num_units, **cell_kwargs)
+        if cell_class == tf.nn.rnn_cell.LSTMCell:
+            cell = cell_class(num_units, cell_clip=1.0, **cell_kwargs)
+        else:
+            cell = cell_class(num_units, **cell_kwargs)
         if layer == num_layers - 1 and not dropout_last_output:
             out_keep_prob = 1.0
         any_drop = any(kp < 1.0 for kp in [in_keep_prob, out_keep_prob, state_keep_prob])
@@ -306,8 +309,9 @@ def create_rnn(
         initial_state = cell.zero_state(batch_size, tf.float32)
     cell_output, final_state = rnn_fn(
         cell=cell, inputs=inputs, sequence_length=sequence_length,
-        initial_state=initial_state, time_major=True, dtype=tf.float32,
-        parallel_iterations=1)
+        initial_state=initial_state, time_major=True, dtype=tf.float32)
+    # parallel_iterations=1)
+    # cell_output = tf.Print(cell_output, [tf.reduce_max(initial_state[1][0])])
     return cell_output, initial_state, final_state
 
 
