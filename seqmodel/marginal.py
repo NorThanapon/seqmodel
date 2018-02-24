@@ -17,7 +17,7 @@ from seqmodel import model as _sqm
 
 __all__ = [
     'AESeqModel', 'GaussianSeqModel', 'VariationalSeqModel',
-    'UnigramSeqModel', 'UnigramSeqModelH', 'VAESeqModel']
+    'UnigramSeqModel', 'UnigramSeqModelH', 'VAESeqModel', 'BackwardSeqModel']
 
 NONE = tf.no_op()
 tfdense = tf.layers.dense
@@ -824,6 +824,8 @@ class UnigramSeqModelH(UnigramSeqModel):
             if isinstance(u_out, tf.nn.rnn_cell.LSTMStateTuple):
                 u_out = u_out.h
                 x = x.h
+            if opt['cell:out_keep_prob'] < 1.0:
+                u_out = tf.nn.dropout(u_out, opt['cell:out_keep_prob'])
             extra_nodes = {'unigram_features': u_out, 'max_num_tokens': max_num_tokens}
             if opt['out:eval_first_token']:
                 cell_output_ = tf.concat([x, cell_output_], axis=0)
@@ -1025,3 +1027,101 @@ class VAESeqModel(UnigramSeqModel):
         sample = mean + scale * tf.random_normal(tf.shape(mean))
         # sample = tf.Print(sample, [tf.reduce_mean(mean), tf.shape(mean)])
         return sample
+
+
+class BackwardSeqModel(_sqm.SeqModel):
+
+    _FULL_SEQ_ = True
+
+    def _output2state(self, opt, outputs, states):
+        self._auto = 0
+
+        def dense(state):
+            h = tfdense(
+                outputs, state.shape[-1], activation=tf.nn.elu, name=f'h_{self._auto}')
+            predict_state = tfdense(
+                h, state.shape[-1], activation=tf.nn.tanh, name=f's_{self._auto}')
+            self._auto = self._auto + 1
+            return predict_state
+
+        return util.nested_map(dense, states)
+
+    def _create_cell(self, opt, get_states=False):
+        cell_opt = util.dict_with_key_startswith(opt, 'cell:')
+        cell = tfg.create_cells(input_size=opt['emb:dim'], **cell_opt)
+        if get_states:
+            return tfcell.StateOutputCellWrapper(cell)
+        return cell
+
+    def _flatten_state(self, state):
+        # XXX: 2 layer lstm cell
+        return tf.concat(
+            [state[0].c, state[0].h, state[1].c, state[1].h], axis=-1)
+
+    def _build_rnn(
+            self, opt, lookup, seq_len, initial_state, batch_size, reuse_scope, reuse,
+            nodes):
+        concat0 = partial(tf.concat, axis=0)
+        new0axis = partial(tf.expand_dims, axis=0)
+        full_reverse0 = partial(
+            tf.reverse_sequence, seq_lengths=seq_len+1, seq_axis=0, batch_axis=1)
+        unroll_rnn = partial(tfg.create_rnn, rnn_fn=opt['rnn:fn'], batch_size=batch_size)
+        extra_nodes = {}
+        # Prior x
+        with tfg.maybe_scope(reuse_scope[self._RSK_RNN_], reuse=True):
+            dec_cell = self._create_cell(opt, get_states=True)
+            (g_dec_out, g_h), g_init_h, g_final_h = unroll_rnn(
+                dec_cell, lookup, seq_len, initial_state)
+            zero_state = dec_cell.zero_state(batch_size, tf.float32)[-1]
+            first_output = g_init_h[-1]
+            if isinstance(first_output, tf.nn.rnn_cell.LSTMStateTuple):
+                first_output = first_output.h
+                zero_state = zero_state.h
+            full_output = tf.concat(
+                (tf.expand_dims(first_output, 0), g_dec_out), 0)
+            if opt['out:eval_first_token']:
+                g_dec_out = full_output
+        # Posterior z
+        with tf.variable_scope('encoder'):
+            full_seq_lookup = nodes.get('full_lookup', lookup)
+            full_seq_lookup = full_reverse0(nodes.get('full_lookup', lookup))
+            enc_cell = self._create_cell(opt, get_states=False)
+            e_enc_out, __, e_final_h = unroll_rnn(
+                enc_cell, full_seq_lookup, seq_len+1, None)
+            e_enc_out = full_reverse0(e_enc_out)
+            # e_enc_out = tfdense(e_enc_out, e_enc_out.shape[-1], activation=tf.nn.elu)
+            # e_enc_out += e_enc_out
+            e_enc_out = tfdense(e_enc_out, e_enc_out.shape[-1], activation=tf.nn.elu)
+            # e_enc_out += e_enc_out
+            e_enc_out = tfdense(e_enc_out, e_enc_out.shape[-1], activation=tf.nn.tanh)
+            # e_all_h = self._output2state(opt, e_enc_out, g_all_h)
+        # extra_nodes.update(
+        #     unigram_features=zero_state, g_states=tf.expand_dims(first_output, 0),
+        #     e_states=e_enc_out)
+        extra_nodes.update(
+            unigram_features=zero_state, g_states=full_output, e_states=e_enc_out)
+        # g_full_h = concat0(
+        #     [new0axis(self._flatten_state(g_init_h)), self._flatten_state(g_h)])
+        # extra_nodes.update(
+        #     unigram_features=zero_state, g_states=g_full_h, e_states=e_enc_out)
+        return dec_cell, g_dec_out, g_init_h, g_final_h, extra_nodes
+
+    # def _build_loss(
+    #         self, opt, logit, label, weight, seq_weight, nodes, collect_key,
+    #         add_to_collection, inputs=None):
+    #     def l2(g_state, e_state):
+    #         return tf.reduce_sum(tf.squared_difference(g_state, e_state) / 2, axis=-1)
+    #     init_w_shape = (1, self._get_batch_size(weight))
+    #     weight = tf.concat([tf.ones(init_w_shape, dtype=tf.float32), weight], 0)
+    #     g_states = nodes['g_states']
+    #     e_states = nodes['e_states']
+    #     # l2_loss = util.nested_map(l2, g_states, e_states)
+    #     # l2_loss = tf.add_n(util.flatten(l2_loss)) * weight
+    #     l2_loss = l2(g_states, e_states) * weight
+    #     # l2_loss = tf.Print(l2_loss, [tf.reduce_mean(l2_loss, 1)])
+    #     l2_loss = tf.reduce_sum(l2_loss)
+    #     num_sequences = tf.reduce_sum(seq_weight)
+    #     num_tokens = tf.reduce_sum(weight)
+    #     eval_fetch = {'eval_loss': l2_loss / num_tokens, 'debug_info': {}}
+    #     train_fetch = {'train_loss': l2_loss / num_sequences, 'debug_info': {}}
+    #     return train_fetch, eval_fetch, {}

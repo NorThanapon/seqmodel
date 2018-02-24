@@ -23,6 +23,7 @@ __all__ = [
     'init_exp_opts', 'save_exp', 'load_exp', 'hstack_with_padding', 'chunks',
     'vstack_with_padding', 'group_data', 'find_first_min_zero', 'nested_map',
     'get_recursive_dict', 'filter_tfvars_in_checkpoint', 'get_model_class',
+    'nested_map_list',
     'log_linear', 'log_normal', 'log_softmax', 'softmax', 'log_sumexp', 'flatten']
 
 
@@ -66,6 +67,20 @@ def nested_map(fn, maybe_structure, *args):
             return type(structure)(*output)
     else:
         return fn(maybe_structure, *args)
+
+
+def nested_map_list(fn, maybe_structure, *args):
+    if isinstance(maybe_structure, (list, tuple)):
+        structure = maybe_structure
+        output = []
+        for maybe_structure in zip(structure, *args):
+            output.append(nested_map_list(fn, *maybe_structure))
+        try:
+            return type(structure)(output)
+        except TypeError:
+            return type(structure)(*output)
+    else:
+        return fn([maybe_structure, *args])
 
 
 def flatten(maybe_structure):

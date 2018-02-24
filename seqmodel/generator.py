@@ -196,8 +196,8 @@ def concat_seq_batch(batch1, batch2):
     label_weight = util.hstack_with_padding(_l1.label_weight, _l2.label_weight)
     _l2.seq_weight[:] = 0
     seq_weight = np.concatenate((_l1.seq_weight, _l2.seq_weight))
-    l = ds.SeqLabelTuple(label, label_weight, seq_weight)
-    return ds.BatchTuple(f, l, _n1 + _n2, _k1)
+    label = ds.SeqLabelTuple(label, label_weight, seq_weight)
+    return ds.BatchTuple(f, label, _n1 + _n2, _k1)
 
 
 def read_seq2seq_data(tokenized_lines, in_vocab, out_vocab):

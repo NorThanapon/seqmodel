@@ -348,13 +348,15 @@ class SeqModel(Model):
                 cell_, lookup, seq_len, initial_state, rnn_fn=opt['rnn:fn'],
                 batch_size=batch_size)
 
+            zero_state = cell_.zero_state(batch_size, tf.float32)[-1]
             first_output = initial_state_[-1]
             if isinstance(first_output, tf.nn.rnn_cell.LSTMStateTuple):
                 first_output = first_output.h
+                zero_state = zero_state.h
             if opt['out:eval_first_token']:
                 cell_output_ = tf.concat(
                     (tf.expand_dims(first_output, 0), cell_output_), 0)
-            rnn_nodes.update(unigram_features=first_output)
+            rnn_nodes.update(unigram_features=zero_state)
         return cell_, cell_output_, initial_state_, final_state_, rnn_nodes
 
     def _build_logit(

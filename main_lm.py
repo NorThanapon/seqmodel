@@ -88,6 +88,8 @@ if __name__ == '__main__':
             max_tokens = 2051910 + 36718
         if opt['char_data']:
             max_tokens = 4000000
+        # max_tokens = max_tokens//100
+
         with sq.open_files(tmp_paths, mode='w') as ofps:
             trace_states = []
             seed_in = np.array([[0] * _b], dtype=np.int32)
