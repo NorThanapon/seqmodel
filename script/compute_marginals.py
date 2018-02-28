@@ -26,7 +26,9 @@ def _parse_args():
     parser.add_argument('--batch_size', type=int, default=64, help='')
     parser.add_argument('--vocab_path', type=str, default='data/ptb/vocab.txt', help='')
     parser.add_argument('--method', type=str, default='init', help='')
-    parser.add_argument('--sampling_trace_name', type=str, default='sample.txt')
+    parser.add_argument('--trace_name', type=str, default='train.txt')
+    parser.add_argument('--trace_random', action='store_true')
+    parser.add_argument('--num_samples', type=int, default=100)
     args = parser.parse_args()
     return args
 
@@ -96,7 +98,7 @@ def _load_model(args, vocab):
 
 
 def _load_trace_states(args):
-    trace_name = args.sampling_trace_name
+    trace_name = args.trace_name
     trace_states = np.load(
         os.path.join(args.model_path, 'marginals', f'{trace_name}-trace.npy'))
     # TODO: preserve batch
@@ -118,60 +120,51 @@ def compute_count_ll(eval_ngrams, ngram_counts, total_tokens):
     return eval_lls
 
 
-def iw_ll(sess, eval_fn, batch, trace_obj, num_samples, unigram=False):
-    # get query state:
+def iw_trace_ll(sess, eval_fn, batch, trace_obj, unigram=False):
+    num_samples = trace_obj['num_samples']
     __, extra = eval_fn(batch.features, batch.labels, extra_fetch=['e_states'])
     first_state = extra[0][0]
     if unigram:
         first_state = extra[0][-1]
-    token_nlls = []
+    token_lls = []
     log_scores = []
-    for j in range(num_samples//10):
+    mini_sample_size = min(10, num_samples)
+    for j in range(num_samples//mini_sample_size):
         choices, all_log_scores = sess.run(
             [trace_obj['tf_trace_choices'], trace_obj['tf_trace_log_scores']],
             {trace_obj['tf_trace_q']: first_state,
-             trace_obj['tf_trace_num']: 10})
-        for i in range(10):
+             trace_obj['tf_trace_num']: mini_sample_size})
+        for i in range(mini_sample_size):
             state = make_state(trace_obj['trace'][choices[:, i]])
             result, __ = eval_fn(batch.features, batch.labels, state=state)
-            token_nlls.append(result['token_nll'])
+            token_lls.append(-result['token_nll'])
         _log_scores = []
         for i in range(len(choices)):
             _log_scores.append(all_log_scores[i][choices[i]])
         log_scores.append(np.stack(_log_scores))
     weights = np.log(1 / len(trace_obj['trace'])) - np.concatenate(log_scores, -1)
-    token_nlls = np.stack(token_nlls, axis=-1)
+    token_lls = np.stack(token_lls, axis=-1)
     # XXX: first token is weighted
-    token_nlls[0, :, :] = token_nlls[0, :, :] - weights
-    avg_tokens_nll = sq.log_sumexp(token_nlls, axis=-1) - np.log(num_samples)
-    # print(weights)
+    token_lls[0, :, :] = token_lls[0, :, :] + weights
+    avg_tokens_ll = sq.log_sumexp(token_lls, axis=-1) - np.log(num_samples)
     if unigram:
-        return avg_tokens_nll[0]
-    return avg_tokens_nll
+        return avg_tokens_ll[0]
+    return avg_tokens_ll
 
 
-def iw_ll_random(sess, eval_fn, batch, trace_obj, num_samples, unigram=False):
-    # get query state:
-    __, extra = eval_fn(batch.features, batch.labels, extra_fetch=['e_states'])
-    first_state = extra[0][0]
-    if unigram:
-        first_state = extra[0][-1]
-    token_nlls = []
+def random_trace_ll(sess, eval_fn, batch, trace_obj, unigram=False):
+    num_samples = trace_obj['num_samples']
+    token_lls = []
     for j in range(num_samples):
         choices = get_random_state_ids(len(batch.features.seq_len))
         state = make_state(trace_obj['trace'][choices])
         result, __ = eval_fn(batch.features, batch.labels, state=state)
-        token_nlls.append(result['token_nll'])
-    weights = 0
-    token_nlls = np.stack(token_nlls, axis=-1)
-    # XXX: first token is weighted
-    token_nlls[0, :, :] = token_nlls[0, :, :] - weights
-    avg_tokens_nll = sq.log_sumexp(token_nlls, axis=-1) - np.log(num_samples)
-    # print(weights)
+        token_lls.append(-result['token_nll'])
+    token_lls = np.stack(token_lls, axis=-1)
+    avg_tokens_ll = sq.log_sumexp(token_lls, axis=-1) - np.log(num_samples)
     if unigram:
-        return avg_tokens_nll[0]
-    return avg_tokens_nll
-
+        return avg_tokens_ll[0]
+    return avg_tokens_ll
 
 # def iw_ll_cpu(sess, eval_fn, batch, trace_obj, num_samples, unigram=False):
 #     # get query state:
@@ -209,55 +202,46 @@ def iw_ll_random(sess, eval_fn, batch, trace_obj, num_samples, unigram=False):
 
 
 def compute_unigram_ll(
-        vocab, sess, nodes, method, batch_size=32, trace_obj=None, num_samples=20):
-    unigram_nlls = []
+        vocab, sess, nodes, method, batch_size=32, trace_obj=None):
     if method == 'init':
         feed_dict = {nodes['temperature']: 1.0, nodes['batch_size']: 1}
         if 'max_num_tokens' in nodes:
             feed_dict[nodes['max_num_tokens']] = 1
-        unigram_nll = sess.run(nodes['log_u_dist'], feed_dict)
-        unigram_nll = np.squeeze(unigram_nll, axis=0)
-        unigram_nlls.append(unigram_nll)
-        nll_count = len(unigram_nlls)
-        unigram_nlls = np.stack(unigram_nlls, axis=-1)
-        unigram_nll = sq.log_sumexp(unigram_nlls, axis=-1) - np.log(nll_count)
+        unigram_ll = sess.run(nodes['log_u_dist'], feed_dict)
+        unigram_ll = np.squeeze(unigram_ll, axis=0)
     elif method == 'trace':
         batch_words = []
         word_set = vocab.word_set()
-        unigram_nll = np.zeros((len(word_set), ), np.float32)
+        unigram_ll = np.zeros((len(word_set), ), np.float32)
         for word in word_set:
             batch_words.append((word, word))
             if len(batch_words) == batch_size:
                 batch = make_batch(vocab, batch_words)
-                batch_lls = iw_ll(
-                    sess, eval_fn, batch, trace_obj, num_samples, unigram=True)
+                batch_lls = trace_obj['trace_ll_fn'](
+                    sess, eval_fn, batch, trace_obj, unigram=True)
                 for bw, ll in zip(batch_words, batch_lls):
-                    unigram_nll[vocab[bw[0]]] = ll
+                    unigram_ll[vocab[bw[0]]] = ll
                 del batch_words[:]
         if len(batch_words) > 0:
             batch = make_batch(vocab, batch_words)
-            batch_lls = iw_ll(
-                sess, eval_fn, batch, trace_obj, num_samples, unigram=True)
+            batch_lls = trace_obj['trace_ll_fn'](
+                sess, eval_fn, batch, trace_obj, unigram=True)
             for bw, ll in zip(batch_words, batch_lls):
-                unigram_nll[vocab[bw[0]]] = ll
-    return unigram_nll.squeeze()
+                unigram_ll[vocab[bw[0]]] = ll
+    return unigram_ll.squeeze()
 
 
-def compute_ll(eval_fn, batch, method, sess, trace_obj=None, num_samples=20):
+def compute_ll(eval_fn, batch, method, sess, trace_obj=None):
     inputs, labels = batch.features, batch.labels
     max_steps = batch.features.inputs.shape[0] + 1
     batch_size = batch.features.inputs.shape[-1]
     if method == 'init':
-        # XXX: remove token_nlls
-        token_nlls = []
         result, __ = eval_fn(inputs, labels)
-        token_nlls.append(result['token_nll'])
-        nll_count = len(token_nlls)
-        token_nlls = np.stack(token_nlls, -1)
-        token_nll = sq.log_sumexp(token_nlls, axis=-1) - np.log(nll_count)
+        token_ll = -result['token_nll']
     elif method == 'trace':
-        token_nll = iw_ll(sess, eval_fn, batch, trace_obj, num_samples, unigram=False)
-    return token_nll
+        token_ll = trace_obj['trace_ll_fn'](
+            sess, eval_fn, batch, trace_obj, unigram=False)
+    return token_ll
 
 
 def make_state(vector):
@@ -304,7 +288,11 @@ if method == 'trace':
         'trace': trace, 'trace_key': trace_key, 'tf_trace_key': tf_trace_key,
         'tf_trace_q': tf_trace_q, 'tf_trace_scores': tf_trace_scores,
         'tf_trace_log_scores': tf_trace_log_scores,
-        'tf_trace_choices': tf_trace_choices, 'tf_trace_num': tf_trace_num}
+        'tf_trace_choices': tf_trace_choices, 'tf_trace_num': tf_trace_num,
+        'num_samples': args.num_samples, 'batch_size': args.batch_size,
+        'trace_ll_fn': iw_trace_ll}
+    if args.trace_random:
+        trace_obj['trace_ll_fn'] = random_trace_ll
     get_random_state_ids = partial(np.random.choice, np.arange(len(trace)))
 print('Computing marginals...')
 if method == 'count':
@@ -314,38 +302,37 @@ elif method in ('init', 'trace'):
     model, nodes, sess = _load_model(args, vocab)
     eval_fn = partial(model.evaluate, sess)
     print('... unigrams ...')
-#     unigram_lls = compute_unigram_ll(
-#         vocab, sess, nodes, method, trace_obj=trace_obj, batch_size=args.batch_size)
-#     print('... n-grams ...')
-#     ngram_lls = {}
-#     _count_progress = 0
-#     for batch in batches():
-#         token_nll = compute_ll(
-#             eval_fn, batch, method, sess, trace_obj=trace_obj)
-#         token_nll = token_nll[:, batch.features.seq_len != 0]
-#         sum_ll = -1.0 * np.sum(token_nll, axis=0)
-#         ngram_idx = np.concatenate([batch.features.inputs[0:1, :], batch.labels.label])
-#         for i in range(len(sum_ll)):
-#             ngram = vocab.i2w(ngram_idx[:batch.features.seq_len[i] + 1, i])
-#             ngram_lls[tuple(ngram)] = sum_ll[i]
-#             _count_progress += 1
-#         if _count_progress % 100 == 0:
-#             print(_count_progress)
-#     eval_lls = []
-#     for ngram in eval_ngrams:
-#         if len(ngram) == 1:
-#             eval_lls.append(unigram_lls[vocab[ngram[0]]])
-#         else:
-#             eval_lls.append(ngram_lls[ngram])
-# else:
-#     raise ValueError('method is not valid')
+    unigram_lls = compute_unigram_ll(
+        vocab, sess, nodes, method, batch_size=args.batch_size, trace_obj=trace_obj)
+    print('... n-grams ...')
+    ngram_lls = {}
+    _count_progress = 0
+    for batch in batches():
+        token_ll = compute_ll(eval_fn, batch, method, sess, trace_obj=trace_obj)
+        token_ll = token_ll[:, batch.features.seq_len != 0]
+        sum_ll = np.sum(token_ll, axis=0)
+        ngram_idx = np.concatenate([batch.features.inputs[0:1, :], batch.labels.label])
+        for i in range(len(sum_ll)):
+            ngram = vocab.i2w(ngram_idx[:batch.features.seq_len[i] + 1, i])
+            ngram_lls[tuple(ngram)] = sum_ll[i]
+            _count_progress += 1
+        if _count_progress % 100 == 0:
+            print(_count_progress)
+    eval_lls = []
+    for ngram in eval_ngrams:
+        if len(ngram) == 1:
+            eval_lls.append(unigram_lls[vocab[ngram[0]]])
+        else:
+            eval_lls.append(ngram_lls[ngram])
+else:
+    raise ValueError('method is not valid')
 
-# print('Writing output file...')
-# eval_lls = np.array(eval_lls)
-# out_directory = os.path.join(args.model_path, 'marginals')
-# sq.ensure_dir(out_directory)
-# out_filename = args.output_filename
-# if out_filename is None:
-#     basename = os.path.basename(args.eval_path)
-#     out_filename = f'{basename}-{time.time()}-lls'
-# np.save(os.path.join(out_directory, out_filename), eval_lls)
+print('Writing output file...')
+eval_lls = np.array(eval_lls)
+out_directory = os.path.join(args.model_path, 'marginals')
+sq.ensure_dir(out_directory)
+out_filename = args.output_filename
+if out_filename is None:
+    basename = os.path.basename(args.eval_path)
+    out_filename = f'{basename}-{time.time()}-lls'
+np.save(os.path.join(out_directory, out_filename), eval_lls)
