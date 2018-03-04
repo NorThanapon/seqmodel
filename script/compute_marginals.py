@@ -9,6 +9,7 @@ from functools import partial
 from collections import ChainMap
 
 import numpy as np
+import h5py
 import tensorflow as tf
 
 sys.path.insert(0, '../')
@@ -28,7 +29,10 @@ def _parse_args():
     parser.add_argument('--method', type=str, default='init', help='')
     parser.add_argument('--trace_name', type=str, default='train.txt')
     parser.add_argument('--trace_random', action='store_true')
-    parser.add_argument('--num_samples', type=int, default=100)
+    parser.add_argument('--gpu_trace', action='store_true')
+    parser.add_argument('--num_samples', type=int, default=20)
+    parser.add_argument('--mini_sample_size', type=int, default=2)
+    parser.add_argument('--num_trace_splits', type=int, default=1)
     args = parser.parse_args()
     return args
 
@@ -99,12 +103,20 @@ def _load_model(args, vocab):
 
 def _load_trace_states(args):
     trace_name = args.trace_name
-    trace_states = np.load(
-        os.path.join(args.model_path, 'marginals', f'{trace_name}-trace.npy'))
-    # TODO: preserve batch
-    trace_states = np.reshape(trace_states, [-1, trace_states.shape[-1]])
-    clean_trace_states = trace_states[~np.all(trace_states == 0, axis=-1)]
-    del trace_states
+    h5py_filename = os.path.join(
+        args.model_path, 'marginals', f'{trace_name}-trace-clean.h5')
+    if os.path.exists(h5py_filename):
+        print('...h5py trace data...')
+        with h5py.File(h5py_filename, 'r') as f:
+            clean_trace_states = f['train-trace-clean'][:, :]
+    else:
+        print('...npy trace data...')
+        trace_states = np.load(
+            os.path.join(args.model_path, 'marginals', f'{trace_name}-trace.npy'))
+        # TODO: preserve batch
+        trace_states = np.reshape(trace_states, [-1, trace_states.shape[-1]])
+        clean_trace_states = trace_states[~np.all(trace_states == 0, axis=-1)]
+        del trace_states
     return clean_trace_states
 
 
@@ -128,12 +140,14 @@ def iw_trace_ll(sess, eval_fn, batch, trace_obj, unigram=False):
         first_state = extra[0][-1]
     token_lls = []
     log_scores = []
-    mini_sample_size = min(10, num_samples)
+    mini_sample_size = min(trace_obj['mini_sample_size'], num_samples)
+    all_log_scores, __ = sess.run(
+            [trace_obj['tf_trace_log_scores'], trace_obj['tf_update_cache']],
+            {trace_obj['tf_trace_q']: first_state})
     for j in range(num_samples//mini_sample_size):
-        choices, all_log_scores = sess.run(
-            [trace_obj['tf_trace_choices'], trace_obj['tf_trace_log_scores']],
-            {trace_obj['tf_trace_q']: first_state,
-             trace_obj['tf_trace_num']: mini_sample_size})
+        choices = sess.run(
+            trace_obj['tf_cache_trace_choices'],
+            {trace_obj['tf_trace_num']: mini_sample_size})
         for i in range(mini_sample_size):
             state = make_state(trace_obj['trace'][choices[:, i]])
             result, __ = eval_fn(batch.features, batch.labels, state=state)
@@ -165,40 +179,6 @@ def random_trace_ll(sess, eval_fn, batch, trace_obj, unigram=False):
     if unigram:
         return avg_tokens_ll[0]
     return avg_tokens_ll
-
-# def iw_ll_cpu(sess, eval_fn, batch, trace_obj, num_samples, unigram=False):
-#     # get query state:
-#     __, extra = eval_fn(batch.features, batch.labels, extra_fetch=['e_states'])
-#     first_state = extra[0][-1]
-#     if unigram:
-#         first_state = extra[0][0]
-#     all_scores = np.matmul(first_state, trace_obj['trace_key'])
-#     all_log_scores = sq.log_softmax(all_scores, axis=-1)
-#     p = sq.softmax(all_scores, axis=-1)
-#     s = p.cumsum(axis=-1)
-#     choices = []
-#     for i in range(num_samples):
-#         r = np.random.rand(p.shape[0], 1)
-#         k = (s < r).sum(axis=-1)
-#         choices.append(k)
-#     choices = np.stack(choices, axis=-1)
-#     token_nlls = []
-#     log_scores = []
-#     for i in range(num_samples):
-#         state = make_state(trace_obj['trace'][choices[:, i]])
-#         result, __ = eval_fn(batch.features, batch.labels, state=state)
-#         token_nlls.append(result['token_nll'])
-#     for i in range(len(choices)):
-#         log_scores.append(all_log_scores[i][choices[i]])
-#     weights = np.log(1 / len(trace_obj['trace'])) - np.stack(log_scores)
-#     token_nlls = np.stack(token_nlls, axis=-1)
-#     # XXX: first token is weighted
-#     token_nlls[0, :, :] = token_nlls[0, :, :] - weights
-#     avg_tokens_nll = sq.log_sumexp(token_nlls, axis=-1) - np.log(num_samples)
-#     # print(weights)
-#     if unigram:
-#         return avg_tokens_nll[0]
-#     return avg_tokens_nll
 
 
 def compute_unigram_ll(
@@ -273,24 +253,52 @@ print('Loading data...')
 vocab, eval_ngrams, batches = _load_data(args)
 trace_obj = None
 if method == 'trace':
-    state_size = 200
     trace = _load_trace_states(args)
+    state_size = trace.shape[-1] // 4  # XXX: 2-layer LSTM cell
     trace_key = trace[:, -state_size:].T
     # trace_key = trace.T
-    tf_trace_key = tf.constant(trace_key, dtype=tf.float32)
-    tf_trace_q = tf.placeholder(dtype=tf.float32, shape=(None, state_size))
-    tf_trace_num = tf.placeholder(dtype=tf.int32, shape=None)
-    tf_trace_scores = tf.matmul(tf_trace_q, tf_trace_key)
-    tf_trace_log_scores = tf.nn.log_softmax(tf_trace_scores)
-    tf_trace_choices = tf.multinomial(
-        tf_trace_scores, tf_trace_num, output_dtype=tf.int32)
     trace_obj = {
-        'trace': trace, 'trace_key': trace_key, 'tf_trace_key': tf_trace_key,
-        'tf_trace_q': tf_trace_q, 'tf_trace_scores': tf_trace_scores,
-        'tf_trace_log_scores': tf_trace_log_scores,
-        'tf_trace_choices': tf_trace_choices, 'tf_trace_num': tf_trace_num,
+        'trace_ll_fn': iw_trace_ll, 'trace': trace, 'trace_key': trace_key,
         'num_samples': args.num_samples, 'batch_size': args.batch_size,
-        'trace_ll_fn': iw_trace_ll}
+        'mini_sample_size': args.mini_sample_size
+    }
+    tf_trace_assigns = []
+    if args.gpu_trace:
+        print('initializing TF trace computation...')
+        tf_trace_q = tf.placeholder(dtype=tf.float32, shape=(None, state_size))
+        tf_trace_num = tf.placeholder(dtype=tf.int32, shape=None)
+        if args.num_trace_splits > 1:
+            chunks = np.array_split(trace_key, args.num_trace_splits, axis=-1)
+            tf_scores = []
+            for i, chunk in enumerate(chunks):
+                # c_tf_trace_key = tf.constant(chunk, dtype=tf.float32)
+                c_tf_trace_key = tf.get_variable(
+                    f'trace_{i}', shape=chunk.shape, trainable=False, dtype=tf.float32)
+                tf_scores.append(tf.matmul(tf_trace_q, c_tf_trace_key))
+                c_tf_trace_ph = tf.placeholder(tf.float32, shape=chunk.shape)
+                c_tf_assign = tf.assign(c_tf_trace_key, c_tf_trace_ph)
+                tf_trace_assigns.append((c_tf_assign, c_tf_trace_ph, chunk))
+            tf_trace_scores = tf.concat(tf_scores, axis=-1)
+        else:
+            tf_trace_key = tf.constant(trace_key, dtype=tf.float32)
+            tf_trace_scores = tf.matmul(tf_trace_q, tf_trace_key)
+        tf_trace_log_scores = tf.nn.log_softmax(tf_trace_scores)
+        tf_trace_choices = tf.multinomial(
+            tf_trace_scores, tf_trace_num, output_dtype=tf.int32)
+        tf_cached_scores = tf.get_variable(
+            'cached_trace_scores', shape=(args.batch_size, trace_key.shape[-1]),
+            dtype=tf.float32, trainable=False)
+        tf_update_cache = tf.assign(tf_cached_scores, tf_trace_scores)
+        tf_cache_trace_choices = tf.multinomial(
+            tf_cached_scores, tf_trace_num, output_dtype=tf.int32)
+        trace_obj.update({
+            'tf_trace_q': tf_trace_q,
+            'tf_trace_scores': tf_trace_scores,
+            'tf_trace_log_scores': tf_trace_log_scores,
+            'tf_cached_scores': tf_cached_scores, 'tf_update_cache': tf_update_cache,
+            'tf_cache_trace_choices': tf_cache_trace_choices,
+            'tf_trace_choices': tf_trace_choices, 'tf_trace_num': tf_trace_num,
+            })
     if args.trace_random:
         trace_obj['trace_ll_fn'] = random_trace_ll
     get_random_state_ids = partial(np.random.choice, np.arange(len(trace)))
@@ -301,6 +309,11 @@ if method == 'count':
 elif method in ('init', 'trace'):
     model, nodes, sess = _load_model(args, vocab)
     eval_fn = partial(model.evaluate, sess)
+    if len(tf_trace_assigns) > 0:
+        print('assigning trace data to TF...')
+        for assign_op, ph, chunk in tf_trace_assigns:
+            sess.run(assign_op, feed_dict={ph: chunk})
+        del tf_trace_assigns
     print('... unigrams ...')
     unigram_lls = compute_unigram_ll(
         vocab, sess, nodes, method, batch_size=args.batch_size, trace_obj=trace_obj)

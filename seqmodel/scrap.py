@@ -967,3 +967,162 @@ class VAESeqModel(UnigramSeqModel):
         sample = mean + scale * tf.random_normal(tf.shape(mean))
         # sample = tf.Print(sample, [tf.reduce_mean(mean), tf.shape(mean)])
         return sample
+
+
+class DiagGaussianMixture(object):
+
+    def __init__(
+            self, n_components=None, dimensions=None, trainable=True, sk_gmm_path=None,
+            means=None, scales=None, weights=None,
+            activation_mean=None, activation_scale=None):
+        init_weights, init_means, init_scales = None, None, None
+        self._K = n_components
+        self._D = dimensions
+        if means is not None and scales is not None and weights is not None:
+            self._means = means
+            self._scales = scales
+            self._weights = weights
+            self._K = weights.shape[-1]
+            self._D = means.shape[-1]
+        else:
+            if sk_gmm_path is not None:
+                with open(sk_gmm_path, mode='rb') as f:
+                    sklearn_gmm = pickle.load(f)
+                self._K = sklearn_gmm.n_components
+                self._D = sklearn_gmm.means_.shape[-1]
+                init_weights = sklearn_gmm.weights_
+                init_means = sklearn_gmm.means_
+                init_scales = np.sqrt(sklearn_gmm.covariances_)
+            with tf.variable_scope('diag_gm') as scope:
+                self._weights, self._means, self._scales = \
+                    DiagGaussianMixture.create_vars(
+                        self.K, self.D, trainable, init_weights, init_means, init_scales,
+                        activation_mean=activation_mean,
+                        activation_scale=activation_scale)
+                self._scope = scope
+
+    def log_pdf_k(self, x, k):
+        if len(x.shape) == 2 and len(self._means.shape) == 2:
+            mean_k = self._means[tf.newaxis, k, :]  # expand batch axis
+            scale_k = self._scales[tf.newaxis, k, :]
+        elif len(x.shape) == 1 and len(self._means.shape) == 2:
+            mean_k = self._means[k, :]
+            scale_k = self._scales[k, :]
+        return log_pdf_mvn_diag(x, mean_k, scale_k)
+
+    def log_pdf(self, x):
+        weights, means, scales = self._weights, self._means, self._scales
+        if len(x.shape) == 2 and len(self._means.shape) == 2:
+            x = x[:, tf.newaxis, :]
+            means = self._means[tf.newaxis, :, :]
+            scales = self._scales[tf.newaxis, :, :]
+            weights = self._weights[tf.newaxis, :]
+        elif len(x.shape) == 1 and len(self._means.shape) == 2:
+            x = x[tf.newaxis, :]
+        log_pdf_K = log_pdf_mvn_diag(x, means, scales)
+        return log_sum_exp(log_pdf_K + tf.log(weights), axis=-1)
+
+    @property
+    def K(self):
+        return self._K
+
+    @property
+    def D(self):
+        return self._D
+
+    @staticmethod
+    def create_vars(
+            num_components, dimensions, trainable=True,
+            init_weights=None, init_means=None, init_scales=None,
+            activation_mean=None, activation_scale=None,
+            scope=None):
+        shape = (num_components, dimensions)
+        with tf.variable_scope(scope or 'gm') as scope:
+            weights = tfg.create_tensor(
+                (num_components, ), trainable=trainable, init=init_weights,
+                name='weights')
+            means = tfg.create_tensor(
+                shape, trainable=trainable, init=init_means, name='means')
+            if activation_mean is not None:
+                means = activation_mean(means)
+            scales = tfg.create_tensor(
+                shape, trainable=trainable, init=init_scales, name='scales')
+            if activation_scale is not None:
+                scales = activation_scale(scales)
+        return weights, means, scales
+
+
+def categorical_graph(
+        K, inputs, temperature=1.0, activation=tf.nn.relu, keep_prob=1.0, scope=None):
+    input_dim = inputs.shape[-1]
+    with tf.variable_scope(scope or 'categorical', reuse=tf.AUTO_REUSE):
+        _inputs = inputs
+        if keep_prob < 1.0:
+            _inputs = tf.nn.dropout(inputs, keep_prob)
+        h1 = tfdense(_inputs, input_dim, activation=activation, name='l1')
+        if keep_prob < 1.0:
+            h1 = tf.nn.dropout(h1, keep_prob)
+        h2 = h1 + _inputs
+        # h2 = tfdense(h1, input_dim, activation=activation, name='l2')
+        if keep_prob < 1.0:
+            h2 = tf.nn.dropout(h2, keep_prob)
+        logits = tfdense(h2, K, name='logits')
+        temp_var = tf.get_variable(
+            'gumbel_temperature', dtype=tf.float32, initializer=temperature,
+            trainable=False)
+        update_temp = tf.assign(temp_var, tf.maximum(0.5, temp_var * 0.99995))
+        with tf.control_dependencies([update_temp]):
+            gumbel = tf.contrib.distributions.RelaxedOneHotCategorical(
+                temp_var, logits=logits)
+            sample = gumbel.sample()
+            return logits, sample
+        # gumbel = tf.contrib.distributions.RelaxedOneHotCategorical(
+        #         temperature, logits=logits)
+        # sample = gumbel.sample()
+        # return logits, sample
+
+
+def gaussian_graph_cat(
+        out_dim, inputs, cat, activation=tf.nn.tanh, scope=None, residual=False,
+        mu_activation=None, scale_activation=tf.nn.sigmoid, keep_prob=0.0):
+    input_dim = inputs.shape[-1]
+    with tf.variable_scope(scope or 'gaussian', reuse=tf.AUTO_REUSE):
+        _inputs = inputs
+        if keep_prob < 1:
+            _inputs = tf.nn.dropout(inputs, keep_prob)
+        _inputs = tf.concat([cat, _inputs], -1)
+        h1 = tfdense(_inputs, input_dim, activation=activation, name='l1')
+        if keep_prob < 1:
+            h1 = tf.nn.dropout(h1, keep_prob)
+        h2 = tfdense(h1, out_dim * 2, activation=activation, name='l2')
+        if keep_prob < 1:
+            h2 = tf.nn.dropout(h2, keep_prob)
+        mu, scale = tf.split(tfdense(h2, out_dim * 2, name='mu_scale'), 2, axis=-1)
+        if mu_activation is not None:
+            mu = mu_activation(mu)
+        if scale_activation is not None:
+            scale = scale_activation(scale)
+        if residual:
+            mu = mu + inputs
+        sample = sample_normal(mu, scale)
+    return mu, scale, sample
+
+
+def gaussian_graph_K(
+        K, out_dim, inputs, activation=tf.nn.tanh, scope=None,
+        mu_activation=tf.nn.tanh, scale_activation=tf.nn.sigmoid):
+    means = []
+    scales = []
+    samples = []
+    with tf.variable_scope(scope or 'gmm'):
+        for k in range(K):
+            mean, scale, sample = gaussian_graph(
+                out_dim, inputs, activation=activation, scope=f'gmm_{k}',
+                mu_activation=mu_activation, scale_activation=scale_activation)
+            means.append(mean)
+            scales.append(scale)
+            samples.append(sample)
+    means = tf.stack(means, 1)
+    scales = tf.stack(scales, 1)
+    samples = tf.stack(samples, 1)
+    return means, scales, samples

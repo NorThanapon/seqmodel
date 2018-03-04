@@ -13,3 +13,4 @@ __pycache__
 .vscode
 *_steve.*
 *_thor.*
+/curexp

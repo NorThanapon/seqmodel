@@ -372,6 +372,7 @@ class SeqModel(Model):
             unigram_logit_, temperature_, logit_w_, logit_b_ = tfg.get_logit_layer(
                 nodes['unigram_features'], logit_w=logit_w_, logit_b=logit_b_,
                 temperature=temperature_, **logit_opt, **collect_kwargs)
+            # logit_ = tf.Print(logit_, [tf.shape(logit_)])
         # format
         dist_, dec_max_, dec_sample_ = tfg.select_from_logit(logit_)
         log_dist_ = tf.nn.log_softmax(logit_)
