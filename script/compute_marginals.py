@@ -7,6 +7,7 @@ import argparse
 from pydoc import locate
 from functools import partial
 from collections import ChainMap
+from itertools import chain
 
 import numpy as np
 import h5py
@@ -153,7 +154,7 @@ def iw_trace_ll(sess, eval_fn, batch, trace_obj, unigram=False):
             result, __ = eval_fn(batch.features, batch.labels, state=state)
             token_lls.append(-result['token_nll'])
         _log_scores = []
-        for i in range(len(choices)):
+        for i in range(len(trace_obj['batch_size'])):
             _log_scores.append(all_log_scores[i][choices[i]])
         log_scores.append(np.stack(_log_scores))
     weights = np.log(1 / len(trace_obj['trace'])) - np.concatenate(log_scores, -1)
@@ -193,7 +194,11 @@ def compute_unigram_ll(
         batch_words = []
         word_set = vocab.word_set()
         unigram_ll = np.zeros((len(word_set), ), np.float32)
-        for word in word_set:
+        iter_word_set = word_set
+        if len(word_set) % batch_size != 0:
+            pads = ['</s>'] * (batch_size - len(word_set) % batch_size)
+            iter_word_set = chain(word_set, pads)
+        for word in iter_word_set:
             batch_words.append((word, word))
             if len(batch_words) == batch_size:
                 batch = make_batch(vocab, batch_words)
@@ -203,11 +208,12 @@ def compute_unigram_ll(
                     unigram_ll[vocab[bw[0]]] = ll
                 del batch_words[:]
         if len(batch_words) > 0:
-            batch = make_batch(vocab, batch_words)
-            batch_lls = trace_obj['trace_ll_fn'](
-                sess, eval_fn, batch, trace_obj, unigram=True)
-            for bw, ll in zip(batch_words, batch_lls):
-                unigram_ll[vocab[bw[0]]] = ll
+            raise ValueError('vocab size is not divisible by batch size')
+            # batch = make_batch(vocab, batch_words)
+            # batch_lls = trace_obj['trace_ll_fn'](
+            #     sess, eval_fn, batch, trace_obj, unigram=True)
+            # for bw, ll in zip(batch_words, batch_lls):
+            #     unigram_ll[vocab[bw[0]]] = ll
     return unigram_ll.squeeze()
 
 
