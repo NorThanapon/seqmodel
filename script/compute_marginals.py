@@ -32,8 +32,9 @@ def _parse_args():
     parser.add_argument('--trace_random', action='store_true')
     parser.add_argument('--gpu_trace', action='store_true')
     parser.add_argument('--num_samples', type=int, default=20)
-    parser.add_argument('--mini_sample_size', type=int, default=2)
+    parser.add_argument('--mini_sample_size', type=int, default=10)
     parser.add_argument('--num_trace_splits', type=int, default=1)
+    parser.add_argument('--repeat', type=int, default=1)
     args = parser.parse_args()
     return args
 
@@ -154,7 +155,7 @@ def iw_trace_ll(sess, eval_fn, batch, trace_obj, unigram=False):
             result, __ = eval_fn(batch.features, batch.labels, state=state)
             token_lls.append(-result['token_nll'])
         _log_scores = []
-        for i in range(len(trace_obj['batch_size'])):
+        for i in range(trace_obj['batch_size']):
             _log_scores.append(all_log_scores[i][choices[i]])
         log_scores.append(np.stack(_log_scores))
     weights = np.log(1 / len(trace_obj['trace'])) - np.concatenate(log_scores, -1)
@@ -209,11 +210,6 @@ def compute_unigram_ll(
                 del batch_words[:]
         if len(batch_words) > 0:
             raise ValueError('vocab size is not divisible by batch size')
-            # batch = make_batch(vocab, batch_words)
-            # batch_lls = trace_obj['trace_ll_fn'](
-            #     sess, eval_fn, batch, trace_obj, unigram=True)
-            # for bw, ll in zip(batch_words, batch_lls):
-            #     unigram_ll[vocab[bw[0]]] = ll
     return unigram_ll.squeeze()
 
 
@@ -251,6 +247,20 @@ def make_batch(vocab, ngrams):
     labels = sq.SeqLabelTuple(y_arr, token_weight, seq_weight)
     batch = sq.BatchTuple(features, labels, num_tokens, False)
     return batch
+
+
+def write_output(args, eval_lls, irepeat=-1):
+    print('Writing output file...')
+    eval_lls = np.array(eval_lls)
+    out_directory = os.path.join(args.model_path, 'marginals')
+    sq.ensure_dir(out_directory)
+    out_filename = args.output_filename
+    if out_filename is None:
+        basename = os.path.basename(args.eval_path)
+        out_filename = f'{basename}-{time.time()}-lls'
+    if args.repeat > 1:
+        out_filename = f'{out_filename}.{irepeat}'
+    np.save(os.path.join(out_directory, out_filename), eval_lls)
 
 
 args = _parse_args()
@@ -312,6 +322,7 @@ print('Computing marginals...')
 if method == 'count':
     ngram_counts, total_tokens = _load_count_file(args)
     eval_lls = compute_count_ll(eval_ngrams, ngram_counts, total_tokens)
+    write_output(args, eval_lls)
 elif method in ('init', 'trace'):
     model, nodes, sess = _load_model(args, vocab)
     eval_fn = partial(model.evaluate, sess)
@@ -320,38 +331,32 @@ elif method in ('init', 'trace'):
         for assign_op, ph, chunk in tf_trace_assigns:
             sess.run(assign_op, feed_dict={ph: chunk})
         del tf_trace_assigns
-    print('... unigrams ...')
-    unigram_lls = compute_unigram_ll(
-        vocab, sess, nodes, method, batch_size=args.batch_size, trace_obj=trace_obj)
-    print('... n-grams ...')
-    ngram_lls = {}
-    _count_progress = 0
-    for batch in batches():
-        token_ll = compute_ll(eval_fn, batch, method, sess, trace_obj=trace_obj)
-        token_ll = token_ll[:, batch.features.seq_len != 0]
-        sum_ll = np.sum(token_ll, axis=0)
-        ngram_idx = np.concatenate([batch.features.inputs[0:1, :], batch.labels.label])
-        for i in range(len(sum_ll)):
-            ngram = vocab.i2w(ngram_idx[:batch.features.seq_len[i] + 1, i])
-            ngram_lls[tuple(ngram)] = sum_ll[i]
-            _count_progress += 1
-        if _count_progress % 100 == 0:
-            print(_count_progress)
-    eval_lls = []
-    for ngram in eval_ngrams:
-        if len(ngram) == 1:
-            eval_lls.append(unigram_lls[vocab[ngram[0]]])
-        else:
-            eval_lls.append(ngram_lls[ngram])
+    for irepeat in range(args.repeat):
+        print('... unigrams ...')
+        unigram_lls = compute_unigram_ll(
+            vocab, sess, nodes, method, batch_size=args.batch_size, trace_obj=trace_obj)
+        print('... n-grams ...')
+        ngram_lls = {}
+        _count_progress = 0
+        for batch in batches():
+            token_ll = compute_ll(eval_fn, batch, method, sess, trace_obj=trace_obj)
+            token_ll = token_ll[:, batch.features.seq_len != 0]
+            sum_ll = np.sum(token_ll, axis=0)
+            ngram_idx = np.concatenate(
+                [batch.features.inputs[0:1, :], batch.labels.label])
+            for i in range(len(sum_ll)):
+                ngram = vocab.i2w(ngram_idx[:batch.features.seq_len[i] + 1, i])
+                ngram_lls[tuple(ngram)] = sum_ll[i]
+                _count_progress += 1
+            if _count_progress % 1000 == 0:
+                print('.', end='', flush=True)
+        print('')
+        eval_lls = []
+        for ngram in eval_ngrams:
+            if len(ngram) == 1:
+                eval_lls.append(unigram_lls[vocab[ngram[0]]])
+            else:
+                eval_lls.append(ngram_lls[ngram])
+        write_output(args, eval_lls, irepeat)
 else:
     raise ValueError('method is not valid')
-
-print('Writing output file...')
-eval_lls = np.array(eval_lls)
-out_directory = os.path.join(args.model_path, 'marginals')
-sq.ensure_dir(out_directory)
-out_filename = args.output_filename
-if out_filename is None:
-    basename = os.path.basename(args.eval_path)
-    out_filename = f'{basename}-{time.time()}-lls'
-np.save(os.path.join(out_directory, out_filename), eval_lls)

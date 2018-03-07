@@ -817,7 +817,7 @@ class VAESeqModel(UnigramSeqModel):
             batch_size = self._get_batch_size(lookup)
         if opt['out:eval_first_token']:
             # XXX: need to merge
-            return self._build_margina_rnn(
+            return self._build_marginal_rnn(
                 opt, lookup, seq_len, initial_state, batch_size,
                 reuse_scope, reuse, nodes)
 
@@ -857,7 +857,7 @@ class VAESeqModel(UnigramSeqModel):
         rnn_nodes.update(unigram_features=u_out, reset=reset)
         return g_cell_, g_out_, initial_state, final_state, rnn_nodes
 
-    def _build_margina_rnn(
+    def _build_marginal_rnn(
             self, opt, lookup, seq_len, initial_state, batch_size,
             reuse_scope, reuse, nodes):
         # TODO: merge this into the _build_rnn
